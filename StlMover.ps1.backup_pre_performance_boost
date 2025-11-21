@@ -1,0 +1,2690 @@
+﻿<#
+    StlMoverService.ps1
+    Continuous STL mover with multi-mode source selection.
+
+    Modes:
+      - "Local": processes files from a local folder ($SourceDirLocal)
+      - "Ftp"  : downloads from FTP to $DownloadDir and processes there
+      - "Smb"  : processes files from an SMB/UNC folder ($SourceDirSmb)
+
+    Behaviour:
+      - Runs forever, polling every $PollInterval seconds
+      - For each file in the work source (including subfolders):
+          .stl   -> Incoming -> Processed (original removed)
+          others -> Scrap
+      - Hash-based duplicate avoidance with time-limited store (HashRetentionDays)
+      - Config is validated at startup and any warnings are shown in the HUD.
+#>
+
+# Figure out app directory (where this script lives)
+$ScriptPath = $MyInvocation.MyCommand.Path
+$AppDir     = Split-Path $ScriptPath -Parent
+
+# Ensure a consistent current directory
+Set-Location $AppDir
+
+# Load WinSCP .NET assembly path
+$WinSCPdll = Join-Path $AppDir "WinSCPnet.dll"
+
+# Where we keep processed/scrap under app dir
+$ProcessedDir = Join-Path $AppDir "STL_Processed"
+$ScrapDir     = Join-Path $AppDir "STL_Scrap"
+$DownloadDir  = Join-Path $AppDir "STL_Downloads"
+
+# Hash store + log file
+$HashStorePath = Join-Path $AppDir "StlMoverHashes.txt"
+$LogFilePath   = Join-Path $AppDir "StlMoverService.log"
+
+# Store of previously-seen remote file versions
+$FtpSeenStorePath = Join-Path $AppDir "FtpSeen.txt"
+$SeenRemoteFiles  = @{}
+
+# Store of when files first appeared on FTP (for accurate age filtering)
+$FtpArrivalTimePath = Join-Path $AppDir "FtpArrivalTimes.txt"
+$FtpArrivalTimes = @{}
+$Script:FtpArrivalStoreDirty = $false
+
+if (Test-Path $FtpSeenStorePath) {
+    foreach ($line in Get-Content $FtpSeenStorePath -ErrorAction SilentlyContinue) {
+        $key = $line.Trim()
+        if ($key) { $SeenRemoteFiles[$key] = $true }
+    }
+}
+
+# Load FTP arrival times (format: filepath|size|firstSeenTimestamp)
+if (Test-Path $FtpArrivalTimePath) {
+    foreach ($line in Get-Content $FtpArrivalTimePath -ErrorAction SilentlyContinue) {
+        $parts = $line.Trim() -split '\|'
+        if ($parts.Count -eq 3) {
+            $fileKey = "$($parts[0])|$($parts[1])"  # path|size
+            try {
+                $arrivalTime = [DateTime]::Parse($parts[2])
+                $FtpArrivalTimes[$fileKey] = $arrivalTime
+            }
+            catch {
+                # Invalid timestamp, skip
+            }
+        }
+    }
+}
+# ----------------- LOGGING -----------------
+$LogLevelPriority = @{
+    "DEBUG" = 0
+    "INFO"  = 1
+    "WARN"  = 2
+    "ERROR" = 3
+}
+
+function Log {
+    param(
+        [string]$msg,
+        [string]$level = "INFO"
+    )
+
+    # Filter by log level
+    $configLevel = if ($LogLevel) { $LogLevel.ToUpper() } else { "INFO" }
+    $currentPriority = if ($LogLevelPriority.ContainsKey($level)) { $LogLevelPriority[$level] } else { 1 }
+    $minPriority = if ($LogLevelPriority.ContainsKey($configLevel)) { $LogLevelPriority[$configLevel] } else { 1 }
+    
+    if ($currentPriority -lt $minPriority) {
+        return  # Skip this log entry
+    }
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line      = "[{0}] [{1}] {2}" -f $timestamp, $level, $msg
+
+    # Console logging disabled to avoid scrolling between polls.
+    # Uncomment next line to re-enable live log output.
+    # Write-Host $line
+
+    try {
+        Add-Content -LiteralPath $LogFilePath -Value $line
+    }
+    catch {
+        # don't die if logging fails
+    }
+}
+
+function Clear-OldLogFiles {
+    if (-not $LogRetentionDays -or $LogRetentionDays -le 0) {
+        return  # Retention disabled
+    }
+
+    try {
+        $cutoffDate = (Get-Date).AddDays(-$LogRetentionDays)
+        $logDir = Split-Path $LogFilePath -Parent
+        $logBaseName = [System.IO.Path]::GetFileNameWithoutExtension($LogFilePath)
+        
+        Get-ChildItem -Path $logDir -Filter "$logBaseName*.log" -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $cutoffDate } |
+            ForEach-Object {
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                Log "Deleted old log file: $($_.Name) (older than $LogRetentionDays days)" "INFO"
+            }
+    }
+    catch {
+        # Don't fail if log cleanup fails
+    }
+}
+
+# ----------------- DEPENDENCY INITIALIZER -----------------
+function Initialize-WinSCPAssembly {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AssemblyPath
+    )
+
+    $bitness = if ([Environment]::Is64BitProcess) { "x64" } else { "x86" }
+
+    if (-not (Test-Path $AssemblyPath)) {
+        $msg = "WinSCP .NET assembly not found: $AssemblyPath"
+        Log $msg "ERROR"
+        throw $msg
+    }
+
+    try {
+        if (Get-Item -LiteralPath $AssemblyPath -ErrorAction Stop | Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReadOnly }) {
+            Log "WinSCP assembly is read-only; attempting to load regardless." "WARN"
+        }
+
+        try {
+            Add-Type -Path $AssemblyPath -ErrorAction Stop
+        }
+        catch {
+            if ($_.Exception.Message -match "0x80131515" -or $_.Exception.Message -match "Operation is not supported") {
+                try {
+                    Unblock-File -Path $AssemblyPath -ErrorAction Stop
+                    Log "Unblocked WinSCP assembly: $AssemblyPath" "INFO"
+                    Add-Type -Path $AssemblyPath -ErrorAction Stop
+                }
+                catch {
+                    throw
+                }
+            }
+            else {
+                throw
+            }
+        }
+
+        $null = [WinSCP.Protocol]::ftp   # force type resolution
+
+        $fileInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($AssemblyPath)
+        $version  = if ($fileInfo.FileVersion) { $fileInfo.FileVersion } else { "unknown" }
+        $desc     = if ($fileInfo.FileDescription) { $fileInfo.FileDescription } else { "WinSCP .NET assembly" }
+
+        Log "WinSCP assembly loaded ($bitness) - $desc v$version from '$AssemblyPath'."
+    }
+    catch {
+        $msg = "Failed to load WinSCP assembly ($bitness) from '$AssemblyPath': $($_.Exception.Message)"
+        Log $msg "ERROR"
+        throw $msg
+    }
+}
+
+Log "Loaded $($FtpArrivalTimes.Count) FTP arrival time(s) from tracking store."
+
+# Initialize WinSCP assembly after helpers exist
+Initialize-WinSCPAssembly -AssemblyPath $WinSCPdll
+
+# ===================== CONFIG LOADER =========================
+
+# Load config.ps1 sitting next to this script
+$ConfigPath = Join-Path $AppDir "config.ps1"
+
+if (-not (Test-Path $ConfigPath)) {
+    throw "Config file not found: $ConfigPath"
+}
+
+. $ConfigPath   # dot-source so all the $Mode/$Ftp*/etc vars become available
+
+# Normalise ProcessFileTypes (from config.ps1) into an array of extensions
+if (-not $ProcessFileTypes) {
+    throw "Config variable 'ProcessFileTypes' is not defined or empty in config.ps1"
+}
+
+# Allow either "stl,obj" or @(".stl",".obj")
+$ProcessExtensions = @()
+if ($ProcessFileTypes -is [string]) {
+    $ProcessFileTypes = $ProcessFileTypes.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+}
+
+foreach ($ft in $ProcessFileTypes) {
+    $ext = $ft.Trim().ToLowerInvariant()
+    if ($ext.StartsWith(".")) {
+        $ext = $ext.Substring(1)
+    }
+    if ($ext) {
+        $ProcessExtensions += $ext
+    }
+}
+$ProcessExtensions = $ProcessExtensions | Sort-Object -Unique
+$ProcessExtensionSet = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($ext in $ProcessExtensions) {
+    [void]$ProcessExtensionSet.Add($ext)
+}
+
+if (-not $PollInterval -or $PollInterval -le 0) {
+    $PollInterval = 5
+}
+
+if (-not $HashRetentionDays -or $HashRetentionDays -le 0) {
+    $HashRetentionDays = 7
+}
+
+if (-not $Mode) {
+    $Mode = "Local"
+}
+
+if ($null -eq $FtpUseExplicitTls) {
+    $FtpUseExplicitTls = $false
+}
+if (-not $FtpTlsFingerprint) {
+    $FtpTlsFingerprint = ""
+}
+if ($null -eq $FtpAcceptAnyTlsCertificate) {
+    $FtpAcceptAnyTlsCertificate = $false
+}
+
+# --- Disable QuickEdit so the console doesn't pause forever on accidental click ---
+try {
+    $os = [Environment]::OSVersion.Version
+    if ($os.Major -ge 10) {
+        if (-not ("Win32NativeMethods" -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class Win32NativeMethods
+{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out int lpMode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetConsoleMode(IntPtr hConsoleHandle, int dwMode);
+}
+'@
+        }
+
+        $STD_INPUT_HANDLE = -10
+        $hStdin = [Win32NativeMethods]::GetStdHandle($STD_INPUT_HANDLE)
+        if ($hStdin -ne [IntPtr]::Zero) {
+            [int]$consoleModeFlags = 0
+            if ([Win32NativeMethods]::GetConsoleMode($hStdin, [ref]$consoleModeFlags)) {
+                # QuickEdit is 0x40; disable it
+                $newConsoleModeFlags = $consoleModeFlags -band (-bnot 0x40)
+                [Win32NativeMethods]::SetConsoleMode($hStdin, $newConsoleModeFlags) | Out-Null
+            }
+        }
+    }
+}
+catch {
+    # Silent failure - don't break the script if this fails
+}
+
+# ===================== RUNTIME STATE ========================
+
+$ErrorActionPreference = "Continue"
+
+# In-memory hash store: key = hash string, value = $true
+$ProcessedHashes = @{}
+
+$Script:Stats = @{
+    TotalProcessedSTL    = 0
+    TotalScrappedNonStl  = 0
+    TotalDuplicates      = 0
+    LastPollTime         = $null
+    LastFileName         = ""
+    LastFileAction       = ""
+}
+$Script:LastJobs        = @()
+$MaxJobHistory          = 30   # number of recent jobs shown in HUD activity list
+$Script:ConfigWarnings  = @()  # collected during validation
+
+
+# ----------------- CONFIG VALIDATION -----------------
+function Add-ConfigWarning {
+    param(
+        [string]$Message
+    )
+    $Script:ConfigWarnings += $Message
+    Log "CONFIG WARNING: $Message" "WARN"
+}
+
+function Test-Config {
+    # Mode
+    $validModes = @("ftp","local","smb")
+    $modeLower  = $Mode.ToString().ToLowerInvariant()
+
+    if (-not ($validModes -contains $modeLower)) {
+        Add-ConfigWarning "Mode '$Mode' is invalid. Falling back to 'Local'."
+        $Script:Mode = "Local"
+        $GLOBALS:Mode = "Local"
+        $modeLower = "local"
+    }
+
+    # Poll interval
+    if ($PollInterval -le 0) {
+        Add-ConfigWarning "PollInterval <= 0. Using default of 5 seconds."
+        $GLOBALS:PollInterval = 5
+    }
+
+    # Hash retention
+    if ($HashRetentionDays -le 0) {
+        Add-ConfigWarning "HashRetentionDays <= 0. Using default of 7 days."
+        $GLOBALS:HashRetentionDays = 7
+    }
+
+    # ProcessFileTypes
+    if (-not $ProcessExtensions -or $ProcessExtensions.Count -eq 0) {
+        Add-ConfigWarning "No valid ProcessFileTypes found after normalisation. Nothing will be treated as 'processable'."
+    }
+
+    # FTP-specific validation
+    if ($modeLower -eq "ftp") {
+        if (-not $FtpHost) {
+            Add-ConfigWarning "FTP mode is enabled but FtpHost is empty. FTP downloads will fail."
+        }
+        if (-not $FtpUser) {
+            Add-ConfigWarning "FTP mode is enabled but FtpUser is empty."
+        }
+        if (-not $FtpRemoteDir) {
+            Add-ConfigWarning "FTP mode is enabled but FtpRemoteDir is empty. Using '/' implicitly."
+        }
+
+        # Min age
+        if ($FtpMinAgeSeconds -lt 0) {
+            Add-ConfigWarning "FtpMinAgeSeconds < 0. Setting to 0 (disabled)."
+            $GLOBALS:FtpMinAgeSeconds = 0
+        }
+
+        # Seen-store vs delete
+        if ($FtpDeleteAfterDownload -and $FtpSkipPreviouslySeen) {
+            Add-ConfigWarning "FtpDeleteAfterDownload = true and FtpSkipPreviouslySeen = true. Seen-store will be ignored in this configuration."
+        }
+
+        # Folder actions require some write capability
+        if ($FtpMarkFolderAsReceived -or $FtpDeleteSourceFolder) {
+            Add-ConfigWarning "FTP folder post-actions enabled. Server must allow renames/deletes under "$FtpRemoteDir"."
+        }
+
+        if ($FtpUseExplicitTls -and -not $FtpTlsFingerprint -and -not $FtpAcceptAnyTlsCertificate) {
+            Add-ConfigWarning "FtpUseExplicitTls = true but no TLS fingerprint or acceptance override set. Connection will fail if certificate is untrusted."
+        }
+
+        if ($FtpAcceptAnyTlsCertificate) {
+            Add-ConfigWarning "Accepting any TLS certificate. Consider pinning the server fingerprint."
+        }
+    }
+
+    # Local mode validation
+    if ($modeLower -eq "local") {
+        if (-not $SourceDirLocal) {
+            Add-ConfigWarning "Local mode is enabled but SourceDirLocal is empty."
+        }
+    }
+
+    # SMB mode validation
+    if ($modeLower -eq "smb") {
+        if (-not $SourceDirSmb) {
+            Add-ConfigWarning "SMB mode is enabled but SourceDirSmb is empty."
+        }
+        elseif (-not $SourceDirSmb.StartsWith("\\")) {
+            Add-ConfigWarning "SourceDirSmb does not look like a UNC path (\\SERVER\Share\...). Current value: '$SourceDirSmb'."
+        }
+    }
+
+    # Local age filter sanity (future use)
+    if ($EnableFileAgeFilter -and $MinFileAgeSeconds -lt 0) {
+        Add-ConfigWarning "EnableFileAgeFilter is true but MinFileAgeSeconds < 0. Setting MinFileAgeSeconds to 0."
+        $GLOBALS:MinFileAgeSeconds = 0
+    }
+}
+
+# ----------------- HASH UTILITIES -----------------
+function Get-FileHashString {
+    param(
+        [string]$Path
+    )
+
+    try {
+        $hashObj = Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop
+        return $hashObj.Hash
+    }
+    catch {
+        Log "Error hashing '$Path': $($_.Exception.Message)" "ERROR"
+        return $null
+    }
+}
+
+function Test-FileReady {
+    param(
+        [System.IO.FileInfo]$File
+    )
+
+    try {
+        $stream = [System.IO.File]::Open($File.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $stream.Dispose()
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-ExtendedPath {
+    param(
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+
+    $isWindowsPlatform = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
+    if (-not $isWindowsPlatform) { return $Path }
+    if ($Path.StartsWith("\\\\?\\")) { return $Path }
+    if ($Path.Length -lt 240) { return $Path }
+
+    if ($Path.StartsWith("\\\\")) {
+        return "\\\\?\UNC\" + $Path.Substring(2)
+    }
+
+    return "\\\\?\" + $Path
+}
+
+function Move-FileSafely {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+        [Parameter(Mandatory = $true)]
+        [string]$Destination,
+        [switch]$UseRobocopy
+    )
+
+    # Ensure destination directory exists
+    $destDir = Split-Path $Destination -Parent
+    if (-not (Test-Path $destDir)) {
+        try {
+            New-Item -ItemType Directory -Path $destDir -Force -ErrorAction Stop | Out-Null
+        }
+        catch {
+            Log "Failed to create destination directory '$destDir': $($_.Exception.Message)" "ERROR"
+            throw
+        }
+    }
+
+    # Use robocopy for safer moves if requested (handles long paths and special characters better)
+    if ($UseRobocopy) {
+        try {
+            $sourceDir = Split-Path $Source -Parent
+            $sourceFile = Split-Path $Source -Leaf
+            
+            # Robocopy move: /MOV moves files (not directories), /MOVE moves files and deletes empty dirs
+            # /NJH = No Job Header, /NJS = No Job Summary for cleaner output
+            # /R:1 = Retry once, /W:1 = Wait 1 second between retries
+            $robocopyArgs = @(
+                $sourceDir,
+                $destDir,
+                $sourceFile,
+                "/MOV", "/NJH", "/NJS", "/R:1", "/W:1"
+            )
+            
+            $null = & robocopy @robocopyArgs 2>&1
+            $exitCode = $LASTEXITCODE
+            
+            # Robocopy exit codes: 0-7 are success, 8+ are errors
+            # 0 = No files copied (source doesn't exist or already moved)
+            # 1 = Files copied successfully
+            # 2 = Extra files/dirs detected (normal)
+            # 3 = Files copied + extra files (normal)
+            if ($exitCode -le 7) {
+                # Verify file was moved
+                Start-Sleep -Milliseconds 100  # Brief pause for filesystem to update
+                if (-not (Test-Path $Source) -and (Test-Path $Destination)) {
+                    Log "Robocopy move succeeded: '$Source' -> '$Destination'" "DEBUG"
+                    return
+                }
+                elseif ((Test-Path $Destination) -and (Test-Path $Source)) {
+                    # Both exist - delete source (robocopy may have copied instead of moved)
+                    try {
+                        Remove-Item -LiteralPath $Source -Force -ErrorAction Stop
+                        Log "Robocopy copied file, removed source: '$Source' -> '$Destination'" "DEBUG"
+                        return
+                    }
+                    catch {
+                        throw "Robocopy copied but failed to remove source: $($_.Exception.Message)"
+                    }
+                }
+                else {
+                    throw "Robocopy reported success but file verification failed (exit code: $exitCode)"
+                }
+            }
+            else {
+                throw "Robocopy failed with exit code $exitCode"
+            }
+        }
+        catch {
+            Log "Robocopy move failed for '$Source' -> '$Destination': $($_.Exception.Message). Falling back to standard move." "WARN"
+            # Fall through to standard move
+        }
+    }
+
+    # Standard move (original logic)
+    $sourceLong = Get-ExtendedPath -Path $Source
+    $destLong   = Get-ExtendedPath -Path $Destination
+
+    try {
+        if ([System.IO.File]::Exists($destLong)) {
+            [System.IO.File]::Delete($destLong)
+        }
+        [System.IO.File]::Move($sourceLong, $destLong)
+    }
+    catch {
+        $moveError = $_.Exception.Message
+        try {
+            Move-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            Log "Fallback move succeeded for '$Source' -> '$Destination' after .NET failure: $moveError" "DEBUG"
+        }
+        catch {
+            throw
+        }
+    }
+}
+
+function Remove-DirectorySafely {
+    param(
+        [string]$Path
+    )
+
+    try {
+        $longPath = Get-ExtendedPath -Path $Path
+        [System.IO.Directory]::Delete($longPath, $false)
+        return $true
+    }
+    catch {
+        try {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            return $true
+        }
+        catch {
+            Log "Failed to remove empty folder '$Path': $($_.Exception.Message)" "DEBUG"
+            return $false
+        }
+    }
+}
+
+function Import-ProcessedHashStore {
+    if (-not (Test-Path $HashStorePath)) { return }
+
+    $now = Get-Date
+    $cutoff = $now.AddDays(-[double]$HashRetentionDays)
+
+    $lines = Get-Content $HashStorePath -ErrorAction SilentlyContinue
+    if (-not $lines) { return }
+
+    $newLines = New-Object System.Collections.Generic.List[string]
+
+    foreach ($line in $lines) {
+        # Skip empty lines
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        
+        # Stored as: 2025-05-15T12:34:56Z|HASHVALUE
+        $parts = $line.Split("|", 2)
+        if ($parts.Count -ne 2) { continue }
+
+        $dtStr = $parts[0]
+        $hash  = $parts[1]
+
+        # Skip if either part is empty
+        if ([string]::IsNullOrWhiteSpace($dtStr) -or [string]::IsNullOrWhiteSpace($hash)) {
+            continue
+        }
+
+        [datetime]$ts = [datetime]::MinValue
+        if (-not [datetime]::TryParse($dtStr, [ref]$ts)) { continue }
+
+        if ($ts -ge $cutoff) {
+            # Keep this record
+            $newLines.Add($line)
+            if ($hash) {
+                $ProcessedHashes[$hash] = $true
+            }
+        }
+    }
+
+    # Rewrite store with only fresh entries
+    if ($newLines.Count -gt 0) {
+        $newLines | Set-Content -LiteralPath $HashStorePath -Encoding utf8
+    }
+    else {
+        # No valid entries, clear the file
+        Set-Content -LiteralPath $HashStorePath -Value "" -Encoding utf8
+    }
+
+    Log "Loaded $($ProcessedHashes.Count) hash(es) from '$HashStorePath' (cutoff: $cutoff)."
+}
+
+function Get-FtpArrivalKey {
+    param(
+        [string]$RemotePath,
+        [long]$Size
+    )
+    return "{0}|{1}" -f $RemotePath, $Size
+}
+
+function ConvertFrom-FtpArrivalKey {
+    param(
+        [string]$Key
+    )
+
+    $idx = $Key.LastIndexOf("|")
+    if ($idx -lt 0) { return $null }
+
+    $path = $Key.Substring(0, $idx)
+    $size = $Key.Substring($idx + 1)
+
+    return [PSCustomObject]@{
+        Path = $path
+        Size = $size
+    }
+}
+
+function Register-FtpArrivalRecord {
+    param(
+        [string]$RemotePath,
+        [long]$Size,
+        [datetime]$Timestamp
+    )
+
+    $fileKey = Get-FtpArrivalKey -RemotePath $RemotePath -Size $Size
+    $FtpArrivalTimes[$fileKey] = $Timestamp
+
+    $record = "{0}|{1}|{2}" -f $RemotePath, $Size, $Timestamp.ToUniversalTime().ToString("o")
+    try {
+        Add-Content -LiteralPath $FtpArrivalTimePath -Value $record -ErrorAction Stop
+    }
+    catch {
+        Log "FTP: Failed to record arrival time for '$RemotePath': $($_.Exception.Message)" "WARN"
+    }
+}
+
+function Remove-FtpArrivalRecord {
+    param(
+        [string]$RemotePath,
+        [long]$Size
+    )
+
+    $fileKey = Get-FtpArrivalKey -RemotePath $RemotePath -Size $Size
+    if ($FtpArrivalTimes.ContainsKey($fileKey)) {
+        $FtpArrivalTimes.Remove($fileKey) | Out-Null
+        $Script:FtpArrivalStoreDirty = $true
+    }
+}
+
+function Remove-StaleArrivalRecordsForPath {
+    param(
+        [string]$RemotePath,
+        [long]$CurrentSize
+    )
+
+    $removed = 0
+    foreach ($key in @($FtpArrivalTimes.Keys)) {
+        $parts = ConvertFrom-FtpArrivalKey -Key $key
+        if (-not $parts) { continue }
+        if ($parts.Path -eq $RemotePath -and [long]$parts.Size -ne $CurrentSize) {
+            $FtpArrivalTimes.Remove($key) | Out-Null
+            $removed++
+        }
+    }
+
+    if ($removed -gt 0) {
+        $Script:FtpArrivalStoreDirty = $true
+        Log "FTP: Cleared $removed stale arrival time record(s) for '$RemotePath' (size changed)." "DEBUG"
+    }
+}
+
+function Save-FtpArrivalRecords {
+    if (-not $Script:FtpArrivalStoreDirty) { return }
+
+    try {
+        if ($FtpArrivalTimes.Count -eq 0) {
+            Set-Content -LiteralPath $FtpArrivalTimePath -Value "" -Encoding utf8
+        }
+        else {
+            $lines = foreach ($entry in $FtpArrivalTimes.GetEnumerator()) {
+                $parts = ConvertFrom-FtpArrivalKey -Key $entry.Key
+                if (-not $parts) { continue }
+                "{0}|{1}|{2}" -f $parts.Path, $parts.Size, $entry.Value.ToUniversalTime().ToString("o")
+            }
+            $lines | Set-Content -LiteralPath $FtpArrivalTimePath -Encoding utf8
+        }
+        $Script:FtpArrivalStoreDirty = $false
+    }
+    catch {
+        Log "FTP: Failed to persist arrival time store: $($_.Exception.Message)" "WARN"
+    }
+}
+
+function Clear-OldFtpArrivalTimes {
+    # Clean up arrival time records older than retention period
+    $now = Get-Date
+    $cutoff = $now.AddDays(-[double]$HashRetentionDays)
+
+    $keysToRemove = @()
+
+    foreach ($entry in @($FtpArrivalTimes.GetEnumerator())) {
+        $arrivalTime = $entry.Value
+        if (-not ($arrivalTime -is [datetime])) { 
+            $keysToRemove += $entry.Key
+            continue
+        }
+
+        if ($arrivalTime -lt $cutoff) {
+            $keysToRemove += $entry.Key
+        }
+    }
+
+    if ($keysToRemove.Count -eq 0) { return }
+
+    foreach ($key in $keysToRemove) {
+        $FtpArrivalTimes.Remove($key) | Out-Null
+    }
+
+    $Script:FtpArrivalStoreDirty = $true
+    Save-FtpArrivalRecords
+    Log "Cleaned up $($keysToRemove.Count) old FTP arrival time record(s) (cutoff: $cutoff)."
+}
+
+function Add-ProcessedHashRecord {
+    param(
+        [string]$Hash
+    )
+
+    if (-not $Hash) { return }
+
+    $nowUtc = (Get-Date).ToUniversalTime().ToString("o")
+    $line   = "{0}|{1}" -f $nowUtc, $Hash
+
+    try {
+        Add-Content -LiteralPath $HashStorePath -Value $line -Encoding utf8
+    }
+    catch {
+        Log "Failed to append hash '$Hash' to store: $($_.Exception.Message)" "WARN"
+    }
+}
+
+function Test-DuplicateFile {
+    param(
+        [System.IO.FileInfo]$file
+    )
+
+    # Check hash for duplicate detection
+    $hash = Get-FileHashString -Path $file.FullName
+    if (-not $hash) { return $null }
+
+    if ($ProcessedHashes.ContainsKey($hash)) {
+        return $true
+    }
+
+    # Not a duplicate (not in hash store yet)
+    # DON'T record it yet - only record after successful processing
+    return $false
+}
+
+function Add-FileHashToStore {
+    param(
+        [string]$FilePath
+    )
+    
+    Log "Add-FileHashToStore called for: '$FilePath'" "DEBUG"
+    
+    if (-not (Test-Path $FilePath)) {
+        Log "Add-FileHashToStore: File does not exist at '$FilePath'" "ERROR"
+        return
+    }
+    
+    $hash = Get-FileHashString -Path $FilePath
+    Log "Add-FileHashToStore: Computed hash = '$hash'" "DEBUG"
+    
+    if (-not $hash) {
+        Log "Add-FileHashToStore: Failed to compute hash for '$FilePath'" "ERROR"
+        return
+    }
+    
+    if ($ProcessedHashes.ContainsKey($hash)) {
+        Log "Add-FileHashToStore: Hash already exists in store (duplicate), not adding." "DEBUG"
+        return
+    }
+    
+    $ProcessedHashes[$hash] = $true
+    Add-ProcessedHashRecord -Hash $hash
+    Log "Add-FileHashToStore: Successfully recorded hash for '$FilePath'" "INFO"
+}
+
+# ----------------- JOB RECORDS FOR HUD -----------------
+# Track active transfers with progress (for future real-time progress bars)
+$Script:ActiveTransfers = @{}  # Key: filename, Value: @{Status, Progress, StartTime, SizeMB}
+
+function Add-JobRecord {
+    param(
+        [string]   $Name,
+        [string]   $Action,
+        [double]   $SizeMB,
+        [datetime] $FileTime,
+        [int]      $Progress = 100,  # 0-100 for active transfers
+        [double]   $SpeedMBps = 0,   # Transfer speed in MB/s
+        [string]   $ETA = ""         # Estimated time remaining
+    )
+
+    # Check if there's already a "Waiting" or "Download" entry for this file
+    $existingIndex = -1
+    for ($i = 0; $i -lt $Script:LastJobs.Count; $i++) {
+        if ($Script:LastJobs[$i].Name -eq $Name -and 
+            ($Script:LastJobs[$i].Action -like "Waiting*" -or $Script:LastJobs[$i].Action -like "Download*")) {
+            $existingIndex = $i
+            break
+        }
+    }
+
+    $rec = [PSCustomObject]@{
+        Time      = Get-Date      # when we processed it
+        FileTime  = $FileTime     # file's last-write time (for FTP: upload completion)
+        Name      = $Name
+        Action    = $Action
+        SizeMB    = $SizeMB
+        Progress  = $Progress     # 0-100 percentage
+        SpeedMBps = $SpeedMBps    # Transfer speed in MB/s
+        ETA       = $ETA          # Estimated time remaining
+    }
+
+    # If we found an existing entry and this is an update, replace it
+    if ($existingIndex -ge 0) {
+        $Script:LastJobs[$existingIndex] = $rec
+    }
+    # Otherwise add as new entry
+    else {
+        $Script:LastJobs = ,$rec + $Script:LastJobs
+        if ($Script:LastJobs.Count -gt $MaxJobHistory) {
+            $Script:LastJobs = $Script:LastJobs[0..($MaxJobHistory-1)]
+        }
+    }
+}
+
+function Update-DownloadProgress {
+    param(
+        [string]$FileName,
+        [int]$Progress,
+        [double]$SizeMB,
+        [double]$SpeedMBps,
+        [string]$ETA
+    )
+    
+    # Update the job record with progress
+    Add-JobRecord -Name $FileName -Action "Downloading" -SizeMB $SizeMB `
+        -FileTime (Get-Date) -Progress $Progress -SpeedMBps $SpeedMBps -ETA $ETA
+}
+
+function Show-DownloadProgress {
+    param(
+        [string]$FileName,
+        [double]$FileProgress,   # 0.0 - 1.0
+        [double]$OverallProgress, # 0.0 - 1.0 (all transfers in that GetFiles call)
+        [double]$SpeedMBps = 0,
+        [string]$ETA = ""
+    )
+
+    $filePercent    = [int]($FileProgress * 100)
+    $overallPercent = [int]($OverallProgress * 100)
+    $barWidth       = 30
+
+    $filled = [int]($FileProgress * $barWidth)
+    if ($filled -lt 0) { $filled = 0 }
+    if ($filled -gt $barWidth) { $filled = $barWidth }
+
+    $bar = ("█" * $filled) + ("░" * ($barWidth - $filled))
+
+    # Trim file name so line doesn't go crazy wide
+    $maxName = 40
+    if ($FileName.Length -gt $maxName) {
+        $FileName = $FileName.Substring(0, $maxName - 3) + "..."
+    }
+
+    # Format speed
+    $speedStr = ""
+    if ($SpeedMBps -gt 0) {
+        if ($SpeedMBps -ge 1) {
+            $speedStr = " | $($SpeedMBps.ToString('F1'))MB/s"
+        }
+        else {
+            $kbps = $SpeedMBps * 1024
+            $speedStr = " | $($kbps.ToString('F0'))KB/s"
+        }
+    }
+
+    # Format ETA
+    $etaStr = if ($ETA) { " | ETA:$ETA" } else { "" }
+
+    $line = "  ↓ $FileName [$bar] $filePercent%$speedStr$etaStr"
+    $line = $line.PadRight(120)
+
+    # Single updating line
+    Write-Host "`r$line" -NoNewline -ForegroundColor Cyan
+}
+
+function Clear-DownloadProgress {
+    Write-Host "`r$(' ' * 120)`r" -NoNewline
+}
+
+function Clear-CompletedJobs {
+    # Separate active/waiting jobs from completed jobs
+    $activeJobs = @($Script:LastJobs | Where-Object { 
+        $_.Action -like "Waiting*" -or 
+        $_.Action -like "Download*" -or 
+        $_.Action -like "Queued*"
+    })
+    
+    $completedJobs = @($Script:LastJobs | Where-Object { 
+        $_.Action -notlike "Waiting*" -and 
+        $_.Action -notlike "Download*" -and 
+        $_.Action -notlike "Queued*"
+    })
+    
+    # Keep most recent completed jobs up to limit
+    # Calculate how many slots are available after active jobs
+    $availableSlots = $MaxJobHistory - $activeJobs.Count
+    if ($availableSlots -lt 5) { $availableSlots = 5 }  # Always show at least 5 completed
+    
+    if ($completedJobs.Count -gt $availableSlots) {
+        # Keep only the most recent completed jobs
+        $completedJobs = $completedJobs | Sort-Object Time -Descending | Select-Object -First $availableSlots
+    }
+    
+    # Combine: active jobs first (most important), then completed jobs
+    $Script:LastJobs = @($activeJobs) + @($completedJobs)
+}
+
+function Get-TimeAgo {
+    param([datetime]$Time)
+    
+    $span = (Get-Date) - $Time
+    
+    if ($span.TotalMinutes -lt 1) {
+        return "just now"
+    }
+    elseif ($span.TotalMinutes -lt 60) {
+        $mins = [int]$span.TotalMinutes
+        return "$mins min ago"
+    }
+    elseif ($span.TotalHours -lt 24) {
+        $hrs = [int]$span.TotalHours
+        return "$hrs hr ago"
+    }
+    else {
+        $days = [int]$span.TotalDays
+        return "$days day ago"
+    }
+}
+
+# --- Modern HUD renderer - WIDE & COMPACT ---
+function Show-UI {
+    param(
+        [string]$Mode,
+        [string]$WorkSource,
+        [string]$OutputPath,
+        [int]$PollInterval
+    )
+
+    Clear-Host
+
+    $Script:Stats.LastPollTime = Get-Date
+    $now = Get-Date
+
+    # Header - WIDER
+    Write-Host "╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║                                          STL MOVER SERVICE                                                     ║" -ForegroundColor Cyan
+    Write-Host "╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+
+    # Compact config - Row 1
+    Write-Host "  MODE: " -NoNewline -ForegroundColor Yellow
+    Write-Host $Mode -NoNewline -ForegroundColor White
+    
+    # Add inline warnings for destructive modes
+    if ($Mode -ieq "Ftp" -and $FtpDeleteAfterDownload) {
+        Write-Host " [DELETE FILES]" -NoNewline -ForegroundColor Red
+    }
+    if ($FileRenameMode -eq "sequential") {
+        Write-Host " [RENAME FILES]" -NoNewline -ForegroundColor Red
+    }
+    
+    Write-Host "  │  POLL: " -NoNewline -ForegroundColor Yellow
+    Write-Host "${PollInterval}s" -NoNewline -ForegroundColor White
+    Write-Host "  │  TYPES: " -NoNewline -ForegroundColor Yellow
+    Write-Host ($ProcessExtensions -join ", ") -NoNewline -ForegroundColor Cyan
+    Write-Host "  │  STATS: " -NoNewline -ForegroundColor Yellow
+    Write-Host "Processed:" -NoNewline -ForegroundColor Gray
+    Write-Host "$($Script:Stats.TotalProcessedSTL) " -NoNewline -ForegroundColor Green
+    Write-Host "Duplicates:" -NoNewline -ForegroundColor Gray
+    Write-Host "$($Script:Stats.TotalDuplicates) " -NoNewline -ForegroundColor Yellow
+    Write-Host "Scrapped:" -NoNewline -ForegroundColor Gray
+    Write-Host "$($Script:Stats.TotalScrappedNonStl)" -ForegroundColor Red
+    
+    # Compact config - Row 2
+    Write-Host "  SRC: " -NoNewline -ForegroundColor Yellow
+    Write-Host $WorkSource -NoNewline -ForegroundColor Cyan
+    Write-Host "  →  OUT: " -NoNewline -ForegroundColor Yellow
+    Write-Host $OutputPath -ForegroundColor Cyan
+
+    # Show config warnings inline if any
+    if ($Script:ConfigWarnings -and $Script:ConfigWarnings.Count -gt 0) {
+        Write-Host "  ⚠ " -NoNewline -ForegroundColor Yellow
+        Write-Host ($Script:ConfigWarnings -join " • ") -ForegroundColor Yellow
+    }
+
+    # Recent activity section - WIDER with legend
+    Write-Host ""
+    Write-Host "  RECENT ACTIVITY " -NoNewline -ForegroundColor Yellow
+    Write-Host "  [" -NoNewline -ForegroundColor DarkGray
+    Write-Host "↓" -NoNewline -ForegroundColor Cyan
+    Write-Host "=Downloading " -NoNewline -ForegroundColor Gray
+    Write-Host "⋯" -NoNewline -ForegroundColor Cyan
+    Write-Host "=Queued " -NoNewline -ForegroundColor Gray
+    Write-Host "✓" -NoNewline -ForegroundColor Green
+    Write-Host "=Done " -NoNewline -ForegroundColor Gray
+    Write-Host "⊜" -NoNewline -ForegroundColor Yellow
+    Write-Host "=Duplicate " -NoNewline -ForegroundColor Gray
+    Write-Host "✗" -NoNewline -ForegroundColor Red
+    Write-Host "=Scrapped " -NoNewline -ForegroundColor Gray
+    Write-Host "⏳" -NoNewline -ForegroundColor DarkYellow
+    Write-Host "=Waiting" -NoNewline -ForegroundColor Gray
+    Write-Host "]" -ForegroundColor DarkGray
+    Write-Host "  ┌────────────────────────────────────────────────────────────────────────────────────────────────────────────┐" -ForegroundColor DarkGray
+    
+    $jobs = $Script:LastJobs
+    if (-not $jobs -or $jobs.Count -eq 0) {
+        # Show idle state
+        Write-Host "  │  " -NoNewline -ForegroundColor DarkGray
+        Write-Host "Idle - waiting for files..." -ForegroundColor DarkGray -NoNewline
+        Write-Host ("").PadRight(82) -NoNewline
+        Write-Host "│" -ForegroundColor DarkGray
+        
+        if ($Script:Stats.LastFileName) {
+            $lastTime = Get-TimeAgo -Time $Script:Stats.LastPollTime
+            Write-Host "  │  Last transfer: " -NoNewline -ForegroundColor DarkGray
+            Write-Host $lastTime -ForegroundColor Cyan -NoNewline
+            Write-Host ("").PadRight(88 - $lastTime.Length) -NoNewline
+            Write-Host "│" -ForegroundColor DarkGray
+        }
+    }
+    else {
+        # Show active transfers - COMPACT SINGLE-LINE PER FILE
+        foreach ($j in $jobs) {
+            $timeAgo = Get-TimeAgo -Time $j.Time
+            
+            # Truncate filename to fit wider display
+            $displayName = $j.Name
+            $maxNameLength = 65
+            if ($displayName.Length -gt $maxNameLength) {
+                $displayName = $displayName.Substring(0, $maxNameLength - 3) + "..."
+            }
+            
+            # Icon, color, and status text based on action
+            $icon = "•"
+            $color = "White"
+            $status = $j.Action
+            
+            if ($j.Action -eq "Processed") {
+                $icon = "✓"
+                $color = "Green"
+                $status = "PROCESSED"
+            }
+            elseif ($j.Action -eq "Downloaded") {
+                $icon = "✓"
+                $color = "Green"
+                $status = "DOWNLOADED"
+            }
+            elseif ($j.Action -eq "Duplicate") {
+                $icon = "⊜"
+                $color = "Yellow"
+                $status = "DUPLICATE → SCRAP"
+            }
+            elseif ($j.Action -like "Scrap*") {
+                $icon = "✗"
+                $color = "Red"
+                $status = "SCRAPPED"
+            }
+            elseif ($j.Action -like "Waiting*") {
+                $icon = "⏳"
+                $color = "DarkYellow"
+                $status = $j.Action.ToUpper()  # Show remaining seconds
+            }
+            elseif ($j.Action -like "Queued*") {
+                $icon = "⋯"
+                $color = "Cyan"
+                $status = "IN QUEUE"
+            }
+            elseif ($j.Action -like "Download*") {
+                $icon = "↓"
+                $color = "Cyan"
+                $status = "DOWNLOADING"
+            }
+            
+            # Build progress bar if downloading (inline with filename)
+            $progressDisplay = ""
+            if ($j.Progress -lt 100 -and $j.Action -like "Download*") {
+                $barLength = 20
+                $filled = [int](($j.Progress / 100) * $barLength)
+                $empty = $barLength - $filled
+                
+                # Enhanced progress bar with gradient effect
+                $bar = "["
+                for ($p = 0; $p -lt $filled; $p++) {
+                    if ($p -eq $filled - 1 -and $filled -lt $barLength) {
+                        $bar += "▓"  # Gradient at edge
+                    }
+                    else {
+                        $bar += "█"  # Filled
+                    }
+                }
+                $bar += "░" * $empty + "]"
+                
+                # Format percentage
+                $percentStr = "$($j.Progress)%".PadLeft(4)
+                
+                # Format speed if available
+                $speedStr = ""
+                if ($j.SpeedMBps -gt 0) {
+                    if ($j.SpeedMBps -ge 1) {
+                        $speedStr = " $($j.SpeedMBps.ToString('F1'))MB/s"
+                    }
+                    else {
+                        $kbps = $j.SpeedMBps * 1024
+                        $speedStr = " $($kbps.ToString('F0'))KB/s"
+                    }
+                }
+                
+                # Format ETA if available
+                $etaStr = if ($j.ETA) { " ETA:$($j.ETA)" } else { "" }
+                
+                $progressDisplay = "$bar $percentStr$speedStr$etaStr".PadRight(50)
+            }
+            else {
+                $progressDisplay = "".PadRight(50)
+            }
+            
+            # Single-line compact display with status
+            Write-Host "  │ " -NoNewline -ForegroundColor DarkGray
+            Write-Host "$icon " -NoNewline -ForegroundColor $color
+            
+            # For downloading files, show progress bar integrated with filename
+            if ($j.Progress -lt 100 -and $j.Action -like "Download*") {
+                # Filename (truncated)
+                $shortName = $displayName
+                if ($shortName.Length -gt 35) {
+                    $shortName = $shortName.Substring(0, 32) + "..."
+                }
+                Write-Host $shortName.PadRight(35) -NoNewline -ForegroundColor White
+                Write-Host " " -NoNewline
+                
+                # Inline progress bar
+                Write-Host $progressDisplay -NoNewline -ForegroundColor Cyan
+                Write-Host " " -NoNewline
+                Write-Host "$($j.SizeMB.ToString('F1'))MB".PadLeft(8) -NoNewline -ForegroundColor DarkYellow
+            }
+            else {
+                # Finished/processed files: show status and timestamp
+                # Filename
+                $shortName = $displayName
+                if ($shortName.Length -gt 50) {
+                    $shortName = $shortName.Substring(0, 47) + "..."
+                }
+                Write-Host $shortName.PadRight(50) -NoNewline -ForegroundColor White
+                
+                # Status badge
+                Write-Host " [" -NoNewline -ForegroundColor DarkGray
+                Write-Host $status.PadRight(20) -NoNewline -ForegroundColor $color
+                Write-Host "] " -NoNewline -ForegroundColor DarkGray
+                
+                # Time and size
+                Write-Host $timeAgo.PadLeft(10) -NoNewline -ForegroundColor DarkGray
+                Write-Host " " -NoNewline
+                Write-Host "$($j.SizeMB.ToString('F1'))MB".PadLeft(8) -NoNewline -ForegroundColor DarkYellow
+            }
+            Write-Host " │" -ForegroundColor DarkGray
+        }
+    }
+    
+    Write-Host "  └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘" -ForegroundColor DarkGray
+    
+    # Footer with timestamp - compact
+    Write-Host "  " -NoNewline
+    Write-Host $now.ToString("HH:mm:ss") -NoNewline -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+function Show-Countdown {
+    param(
+        [int]$Seconds
+    )
+
+    if ($Seconds -le 0) { return }
+
+    $width = 30
+
+    for ($i = $Seconds; $i -gt 0; $i--) {
+        if ($Seconds -eq 0) {
+            $done = $width
+        }
+        else {
+            $done = [int]( ($Seconds - $i) / [double]$Seconds * $width )
+        }
+        if ($done -lt 0) { $done = 0 }
+        if ($done -gt $width) { $done = $width }
+
+        $remaining = $width - $done
+        $bar = ("#" * $done) + ("." * $remaining)
+        $msg = "  Next poll in {0}s [{1}]" -f $i, $bar
+
+        Write-Host "`r$msg" -NoNewline -ForegroundColor Gray
+        Start-Sleep -Seconds 1
+    }
+
+    Write-Host "`r  Polling now...".PadRight(50) -NoNewline -ForegroundColor Yellow
+    Start-Sleep -Milliseconds 500
+    Write-Host ""
+}
+
+# ----------------- FOLDER ENSURER -----------------
+function Initialize-Folders {
+    foreach ($d in @($ProcessedDir, $ScrapDir, $DownloadDir)) {
+        if (-not (Test-Path $d)) {
+            New-Item -ItemType Directory -Path $d -Force | Out-Null
+            Log "Created folder: $d"
+        }
+    }
+}
+
+# ----------------- LIVE STATUS DISPLAY -----------------
+function Write-LiveStatus {
+    param(
+        [string]$Status,
+        [string]$FileName = "",
+        [long]$FileSizeMB = 0,
+        [int]$Progress = -1
+    )
+    
+    # Truncate filename to fit on one line
+    $maxLength = 60
+    if ($FileName.Length -gt $maxLength) {
+        $FileName = $FileName.Substring(0, $maxLength - 3) + "..."
+    }
+    
+    $line = "  ⟳ $Status"
+    if ($FileName) {
+        $line += ": $FileName"
+        if ($FileSizeMB -gt 0) {
+            $line += " ($($FileSizeMB.ToString('F1')) MB)"
+        }
+    }
+    if ($Progress -ge 0) {
+        $line += " - $Progress%"
+    }
+    
+    # Pad to clear previous line
+    $line = $line.PadRight(120)
+    
+    Write-Host "`r$line" -NoNewline -ForegroundColor Cyan
+}
+
+function Clear-LiveStatus {
+    Write-Host "`r" + (" " * 120) + "`r" -NoNewline
+}
+
+# ----------------- FTP DOWNLOAD (RECURSIVE, STRUCTURE-PRESERVING) -----------------
+function Get-FtpFolderState {
+    param(
+        [hashtable]$FolderTable,
+        [string]$RemoteFolder,
+        [string]$RootToProtect
+    )
+
+    if (-not $FolderTable -or -not $RemoteFolder) { return $null }
+
+    # Never track the FTP root itself
+    if ($RemoteFolder -eq "/" -or $RemoteFolder -eq $RootToProtect) {
+        return $null
+    }
+
+    if (-not $FolderTable.ContainsKey($RemoteFolder)) {
+        $FolderTable[$RemoteFolder] = [PSCustomObject]@{
+            Path          = $RemoteFolder
+            Touched       = $false
+            AllSucceeded  = $true
+            Downloaded    = 0
+            SkippedTooNew = 0
+            SkippedSeen   = 0
+        }
+    }
+
+    return $FolderTable[$RemoteFolder]
+}
+
+function Invoke-FtpDownload {
+    Log "FTP: checking for new files..."
+    Write-LiveStatus -Status "Connecting to FTP server" -FileName "$FtpHost"
+
+    try {
+        $opts = New-Object WinSCP.SessionOptions -Property @{
+            Protocol   = [WinSCP.Protocol]::ftp
+            HostName   = $FtpHost
+            UserName   = $FtpUser
+            Password   = $FtpPassword
+            PortNumber = 21
+        }
+
+        if ($FtpUseExplicitTls) {
+            $opts.FtpSecure = [WinSCP.FtpSecure]::Explicit
+            if ($FtpTlsFingerprint) {
+                $opts.TlsHostCertificateFingerprint = $FtpTlsFingerprint
+            }
+            elseif ($FtpAcceptAnyTlsCertificate) {
+                $opts.GiveUpSecurityAndAcceptAnyTlsHostCertificate = $true
+            }
+        }
+        else {
+            $opts.FtpSecure = [WinSCP.FtpSecure]::None
+        }
+
+        $session = New-Object WinSCP.Session
+        
+        # Track progress for current file transfer
+        $Script:CurrentTransferStart = $null
+        $Script:CurrentTransferFile = ""
+        $Script:CurrentTransferSize = 0
+        $Script:LastProgressUpdate = [DateTime]::MinValue
+        $Script:LoggedFirstProgress = $false
+        $Script:DebugProgressErrors = $true  # Enable debug logging for progress handler
+
+        # Add FileTransferProgress event handler BEFORE opening session
+        $progressHandler = {
+            param($sender, $e)
+            
+            try {
+                # Throttle updates to avoid overwhelming the display (update max every 200ms)
+                $now = Get-Date
+                if ($now -lt $Script:LastProgressUpdate.AddMilliseconds(200)) {
+                    return
+                }
+                $Script:LastProgressUpdate = $now
+                
+                # WinSCP provides FileProgress and OverallProgress as direct double values (0.0 - 1.0)
+                $fileProgress = if ($e.FileProgress) { [double]$e.FileProgress } else { 0.0 }
+                $overallProgress = if ($e.OverallProgress) { [double]$e.OverallProgress } else { 0.0 }
+                $progress = [int]($fileProgress * 100)
+                
+                # Debug: Log first progress event for each file
+                if (-not $Script:LoggedFirstProgress -and $progress -gt 0) {
+                    Log "FTP Progress: First update at $progress% (FileProgress=$fileProgress, CPS=$($e.CPS))" "DEBUG"
+                    $Script:LoggedFirstProgress = $true
+                }
+                
+                # Calculate transfer speed and ETA
+                $speedMBps = 0
+                $eta = ""
+                if ($Script:CurrentTransferStart -and $e.CPS) {
+                    # CPS = Characters (bytes) Per Second from WinSCP
+                    $speedMBps = $e.CPS / 1MB
+                    
+                    # Calculate ETA from progress and speed
+                    if ($speedMBps -gt 0 -and $fileProgress -gt 0 -and $fileProgress -lt 1) {
+                        $elapsed = ($now - $Script:CurrentTransferStart).TotalSeconds
+                        $remainingProgress = 1.0 - $fileProgress
+                        $remainingSeconds = ($elapsed / $fileProgress) * $remainingProgress
+                        
+                        if ($remainingSeconds -lt 60) {
+                            $eta = "$([int]$remainingSeconds)s"
+                        }
+                        elseif ($remainingSeconds -lt 3600) {
+                            $eta = "$([int]($remainingSeconds / 60))m $([int]($remainingSeconds % 60))s"
+                        }
+                        else {
+                            $eta = "$([int]($remainingSeconds / 3600))h $([int](($remainingSeconds % 3600) / 60))m"
+                        }
+                    }
+                }
+                
+                # Show live progress bar at bottom of console (in addition to HUD integration)
+                if ($e.FileName) {
+                    $shortName = Split-Path $e.FileName -Leaf
+                    Show-DownloadProgress -FileName $shortName `
+                        -FileProgress $fileProgress `
+                        -OverallProgress $overallProgress `
+                        -SpeedMBps $speedMBps `
+                        -ETA $eta
+                }
+                
+                # Also update job record with progress for HUD table
+                if ($Script:CurrentTransferFile) {
+                    Update-DownloadProgress -FileName $Script:CurrentTransferFile `
+                        -Progress $progress -SizeMB $Script:CurrentTransferSize `
+                        -SpeedMBps $speedMBps -ETA $eta
+                }
+            }
+            catch {
+                # Log progress handler errors for debugging but don't disrupt transfers
+                if ($Script:DebugProgressErrors) {
+                    Log "FTP Progress handler error: $($_.Exception.Message)" "DEBUG"
+                }
+            }
+        }
+        
+        $session.add_FileTransferProgress($progressHandler)
+
+        try {
+            $session.Open($opts)
+            Write-LiveStatus -Status "Connected - Enumerating files" -FileName "$FtpRemoteDir"
+
+            $cutoff = $null
+            if ([double]$FtpMinAgeSeconds -gt 0) {
+                $cutoff = (Get-Date).AddSeconds(-[double]$FtpMinAgeSeconds)
+                Log "FTP: Age filter enabled - files must be older than $FtpMinAgeSeconds seconds (cutoff: $($cutoff.ToString('yyyy-MM-dd HH:mm:ss')))"
+            }
+
+            $normalizedRoot = $FtpRemoteDir
+            if ([string]::IsNullOrWhiteSpace($normalizedRoot)) {
+                $normalizedRoot = "/"
+            }
+            $normalizedRoot = $normalizedRoot.TrimEnd('/')
+            if ([string]::IsNullOrWhiteSpace($normalizedRoot)) {
+                $normalizedRoot = "/"
+            }
+
+            $folderInfo       = @{}
+            $downloadedCount  = 0
+            $skippedTooNew    = 0
+            $skippedSeen      = 0
+            $anyFileEnumerated = $false
+
+            $transferOptions = New-Object WinSCP.TransferOptions
+            $transferOptions.TransferMode      = [WinSCP.TransferMode]::Binary
+            $transferOptions.PreserveTimestamp = $true
+            # Disable temp file usage - write directly to avoid AV interference
+            $transferOptions.ResumeSupport.State = [WinSCP.TransferResumeSupportState]::Off
+            # Force overwrite if file exists
+            $transferOptions.OverwriteMode = [WinSCP.OverwriteMode]::Overwrite
+
+            $enumerationCount = 0
+            foreach ($rf in $session.EnumerateRemoteFiles($normalizedRoot, "*", [WinSCP.EnumerationOptions]::AllDirectories)) {
+                if ($rf.IsDirectory) { continue }
+                $anyFileEnumerated = $true
+                $enumerationCount++
+                
+                # Update status every file during enumeration
+                $sizeMB = [Math]::Round($rf.Length / 1MB, 1)
+                Write-LiveStatus -Status "Scanning" -FileName $rf.Name -FileSizeMB $sizeMB
+
+                $remotePath = $rf.FullName
+
+                # Skip files already marked as RECEIVED on the server
+                if ($remotePath -match '_RECEIVED[/\\]' -or $remotePath -match '_RECEIVED$') {
+                    continue
+                }
+
+                $remoteFolder = Split-Path $remotePath -Parent
+                $folderState  = Get-FtpFolderState -FolderTable $folderInfo -RemoteFolder $remoteFolder -RootToProtect $normalizedRoot
+                if ($folderState) { $folderState.Touched = $true }
+
+                $now = Get-Date
+                Remove-StaleArrivalRecordsForPath -RemotePath $remotePath -CurrentSize $rf.Length
+
+                $fileKey = Get-FtpArrivalKey -RemotePath $remotePath -Size $rf.Length
+                if (-not $FtpArrivalTimes.ContainsKey($fileKey)) {
+                    Register-FtpArrivalRecord -RemotePath $remotePath -Size $rf.Length -Timestamp $now
+                    Log "FTP: New file detected '$remotePath' - recorded arrival time: $($now.ToString('yyyy-MM-dd HH:mm:ss'))" "DEBUG"
+                }
+
+                $arrivalTime = $FtpArrivalTimes[$fileKey]
+                if (-not $arrivalTime) {
+                    $arrivalTime = $now
+                    $FtpArrivalTimes[$fileKey] = $arrivalTime
+                }
+
+                # Age filter (based on time observed on server, not modification time)
+                if ($cutoff) {
+                    $timeOnServer = ($now - $arrivalTime).TotalSeconds
+                    if ($timeOnServer -lt $FtpMinAgeSeconds) {
+                        $skippedTooNew++
+                        if ($folderState) { $folderState.SkippedTooNew++ }
+
+                        $sizeMB = [Math]::Round($rf.Length / 1MB, 2)
+                        $timeLeft = $FtpMinAgeSeconds - [int]$timeOnServer
+                        Add-JobRecord -Name $rf.Name -Action "Waiting ($timeLeft`s left)" -SizeMB $sizeMB -FileTime $arrivalTime
+                        Log "FTP: Skipping '$remotePath' - on server for $([int]$timeOnServer)s, need $FtpMinAgeSeconds s." "INFO"
+                        continue
+                    }
+                }
+
+                # Skip if already processed (seen-store) when not deleting remote files
+                if ($FtpSkipPreviouslySeen -and -not $FtpDeleteAfterDownload) {
+                    $seenKey = "{0}|{1:o}|{2}" -f $rf.FullName, $rf.LastWriteTime.ToUniversalTime(), $rf.Length
+                    if ($SeenRemoteFiles.ContainsKey($seenKey)) {
+                        $skippedSeen++
+                        if ($folderState) { $folderState.SkippedSeen++ }
+                        continue
+                    }
+                }
+
+                # Determine relative path under the monitored root
+                $relativeRemote = $remotePath
+                if ($normalizedRoot -ne "/") {
+                    if ($relativeRemote.StartsWith($normalizedRoot)) {
+                        $relativeRemote = $relativeRemote.Substring($normalizedRoot.Length)
+                    }
+                }
+                $relativeRemote = $relativeRemote.TrimStart('/')
+                if (-not $relativeRemote) {
+                    $relativeRemote = $rf.Name
+                }
+
+                $relativeLocal = $relativeRemote -replace '/', '\'
+                $localFile     = Join-Path $DownloadDir $relativeLocal
+                $localDir      = Split-Path $localFile -Parent
+
+                if (-not (Test-Path $localDir)) {
+                    New-Item -ItemType Directory -Path $localDir -Force | Out-Null
+                    Log "Created local download subdirectory: $localDir"
+                }
+
+                # Show file entering download queue
+                $fileSize = [Math]::Round($rf.Length / 1MB, 1)
+                Add-JobRecord -Name $rf.Name -Action "Queued for download" -SizeMB $fileSize -FileTime $rf.LastWriteTime
+
+                Log "FTP: downloading '$remotePath' -> '$localFile'."
+                
+                # Update status to show download
+                $fileSize = [Math]::Round($rf.Length / 1MB, 1)
+                Write-LiveStatus -Status "Downloading" -FileName $rf.Name -FileSizeMB $fileSize
+                
+                # Initialize transfer tracking for progress handler
+                $Script:CurrentTransferStart = Get-Date
+                $Script:CurrentTransferFile = $rf.Name
+                $Script:CurrentTransferSize = $fileSize
+                $Script:LoggedFirstProgress = $false
+                
+                # Add initial job record with 0% progress
+                Add-JobRecord -Name $rf.Name -Action "Downloading" -SizeMB $fileSize `
+                    -FileTime $rf.LastWriteTime -Progress 0 -SpeedMBps 0 -ETA "calculating..."
+                
+                # Check BEFORE download
+                $existedBefore = Test-Path $localFile
+                if ($existedBefore) {
+                    Log "FTP: File already exists at destination before download: '$localFile'" "WARN"
+                }
+                
+                try {
+                    # GetFiles(remotePath, localPath, remove, options)
+                    # Use .EscapeFileMask to prevent wildcard interpretation
+                    $escapedRemotePath = [WinSCP.RemotePath]::EscapeFileMask($remotePath)
+                    $result = $session.GetFiles($escapedRemotePath, $localFile, $false, $transferOptions)
+                    $result.Check()
+                    
+                    # Clear transfer tracking
+                    $Script:CurrentTransferStart = $null
+                    $Script:CurrentTransferFile = ""
+                    $Script:CurrentTransferSize = 0
+                    
+                    if ($result.Transfers.Count -eq 0) {
+                        Log "FTP: WinSCP reports NO transfers occurred for '$remotePath'" "ERROR"
+                        if ($folderState) { $folderState.AllSucceeded = $false }
+                        
+                        # Update job to show failure
+                        Add-JobRecord -Name $rf.Name -Action "Download Failed" -SizeMB $fileSize `
+                            -FileTime $rf.LastWriteTime -Progress 100
+                        continue
+                    }
+                    
+                    $transfer = $result.Transfers[0]
+                    if ($transfer.Error) {
+                        Log "FTP: Transfer failed for '$remotePath': $($transfer.Error.Message)" "ERROR"
+                        if ($folderState) { $folderState.AllSucceeded = $false }
+                        
+                        # Update job to show failure
+                        Add-JobRecord -Name $rf.Name -Action "Download Failed" -SizeMB $fileSize `
+                            -FileTime $rf.LastWriteTime -Progress 100
+                        continue
+                    }
+                    
+                    # Calculate final transfer speed
+                    $finalSpeed = 0
+                    if ($Script:CurrentTransferStart) {
+                        try {
+                            $transferTime = ((Get-Date) - $Script:CurrentTransferStart).TotalSeconds
+                            if ($transferTime -gt 0) { $finalSpeed = $fileSize / $transferTime }
+                        }
+                        catch {
+                            # Ignore speed calculation errors
+                        }
+                    }
+                    
+                    Log "FTP: WinSCP transfer completed - Local: '$($transfer.Destination)', Size: $($transfer.Length) bytes, Speed: $($finalSpeed.ToString('F1')) MB/s" "DEBUG"
+                    
+                    # Update job record to show completed download (100%)
+                    Add-JobRecord -Name $rf.Name -Action "Downloaded" -SizeMB $fileSize `
+                        -FileTime $rf.LastWriteTime -Progress 100 -SpeedMBps $finalSpeed -ETA "done"
+                }
+                catch {
+                    Log "FTP error downloading '$remotePath': $($_.Exception.Message)" "ERROR"
+                    if ($folderState) { $folderState.AllSucceeded = $false }
+                    
+                    # Update job to show failure
+                    Add-JobRecord -Name $rf.Name -Action "Download Failed" -SizeMB $fileSize `
+                        -FileTime $rf.LastWriteTime -Progress 100
+                    continue
+                }
+
+                # Check IMMEDIATELY after download
+                $existsImmediately = Test-Path $localFile
+                if ($existsImmediately) {
+                    $fileInfo = Get-Item $localFile -ErrorAction SilentlyContinue
+                    if ($fileInfo) {
+                        Log "FTP: Download SUCCESS - file exists, size: $($fileInfo.Length) bytes" "INFO"
+                    }
+                }
+                else {
+                    Log "FTP: CRITICAL - File does NOT exist immediately after WinSCP reports success: '$localFile'" "ERROR"
+                }
+
+                # Clear the live progress bar after download completes
+                Clear-DownloadProgress
+                
+                # Update job record to show completion
+                Add-JobRecord -Name $rf.Name -Action "Downloaded" -SizeMB $fileSize `
+                    -FileTime $rf.LastWriteTime -Progress 100
+
+                $downloadedCount++
+                if ($folderState) { $folderState.Downloaded++ }
+                Remove-FtpArrivalRecord -RemotePath $remotePath -Size $rf.Length
+
+                # Mark remote file version as seen if we cannot delete it
+                if ($FtpSkipPreviouslySeen -and -not $FtpDeleteAfterDownload) {
+                    $seenKey = "{0}|{1:o}|{2}" -f $rf.FullName, $rf.LastWriteTime.ToUniversalTime(), $rf.Length
+                    if (-not $SeenRemoteFiles.ContainsKey($seenKey)) {
+                        $SeenRemoteFiles[$seenKey] = $true
+                        $seenKey | Out-File $FtpSeenStorePath -Encoding utf8 -Append
+                        Log "Marked remote file as seen: $seenKey"
+                    }
+                }
+
+                # Optionally delete remote file after download
+                if ($FtpDeleteAfterDownload) {
+                    try {
+                        # Use escaped path for deletion too
+                        $rmResult = $session.RemoveFiles($escapedRemotePath)
+                        if ($rmResult.IsSuccess) {
+                            Log "FTP: deleted remote file '$remotePath' after successful download." "INFO"
+                        }
+                        else {
+                            Log "FTP: FAILED to delete remote file '$remotePath' after download." "WARN"
+                            if ($folderState) { $folderState.AllSucceeded = $false }
+                        }
+                    }
+                    catch {
+                        Log "FTP: error deleting remote file '$remotePath': $($_.Exception.Message)" "ERROR"
+                        if ($folderState) { $folderState.AllSucceeded = $false }
+                    }
+                }
+            }
+
+            Save-FtpArrivalRecords
+
+            # Clear live progress bar and status before showing summary
+            Clear-DownloadProgress
+            Clear-LiveStatus
+            
+            if (-not $anyFileEnumerated) {
+                Write-Host "  ✓ FTP scan complete - No files found" -ForegroundColor DarkGray
+                Log "FTP: no files found under '$normalizedRoot'."
+            }
+            elseif ($downloadedCount -eq 0) {
+                if ($skippedTooNew -gt 0) {
+                    Write-Host "  ⏱ FTP scan complete - $enumerationCount found, $skippedTooNew too new" -ForegroundColor Yellow
+                    Log "FTP: no files older than $FtpMinAgeSeconds second(s) under '$normalizedRoot'. ($skippedTooNew skipped as too new)"
+                }
+                elseif ($skippedSeen -gt 0) {
+                    Write-Host "  ✓ FTP scan complete - $enumerationCount found, $skippedSeen already seen" -ForegroundColor DarkGray
+                    Log "FTP: all files under '$normalizedRoot' were already seen ($skippedSeen skipped)."
+                }
+                else {
+                    Write-Host "  ✓ FTP scan complete - $enumerationCount found, none qualified" -ForegroundColor DarkGray
+                    Log "FTP: files were found but none qualified for download under '$normalizedRoot'."
+                }
+            }
+            else {
+                Clear-DownloadProgress
+                Write-Host "  ✓ FTP download complete - $downloadedCount file(s) downloaded" -ForegroundColor Green
+                Log "FTP: downloaded $downloadedCount file(s) from '$normalizedRoot' and below."
+            }
+
+            # Check for and delete empty folders (only if files were downloaded to avoid unnecessary scanning)
+            if ($FtpDeleteSourceFolder -and $downloadedCount -gt 0) {
+                try {
+                    Log "FTP: Checking for empty folders under '$normalizedRoot'..." "DEBUG"
+                    $emptyFoldersDeleted = 0
+                    
+                    # Recursive function to find and check all directories
+                    function Find-EmptyFolders {
+                        param(
+                            [WinSCP.Session]$Session,
+                            [string]$CurrentPath,
+                            [string]$RootPath,
+                            [System.Collections.ArrayList]$EmptyFoldersList
+                        )
+                        
+                        try {
+                            Log "FTP: Listing directory: '$CurrentPath'" "DEBUG"
+                            $files = $Session.ListDirectory($CurrentPath)
+                            
+                            # Get all subdirectories first
+                            $subDirs = @()
+                            foreach ($fileInfo in $files.Files) {
+                                if ($fileInfo.IsDirectory -and $fileInfo.Name -ne "." -and $fileInfo.Name -ne "..") {
+                                    $subDirPath = if ($CurrentPath -eq "/") { 
+                                        "/$($fileInfo.Name)" 
+                                    } 
+                                    else { 
+                                        "$CurrentPath/$($fileInfo.Name)" 
+                                    }
+                                    $subDirs += $subDirPath
+                                }
+                            }
+                            
+                            # Recursively check subdirectories (deepest first)
+                            foreach ($subDir in $subDirs) {
+                                Find-EmptyFolders -Session $Session -CurrentPath $subDir -RootPath $RootPath -EmptyFoldersList $EmptyFoldersList
+                            }
+                            
+                            # Now check if current directory is empty (after checking subdirectories)
+                            $hasFiles = $false
+                            $hasSubDirs = $false
+                            foreach ($fileInfo in $files.Files) {
+                                if ($fileInfo.Name -ne "." -and $fileInfo.Name -ne "..") {
+                                    if ($fileInfo.IsDirectory) {
+                                        $hasSubDirs = $true
+                                    }
+                                    else {
+                                        $hasFiles = $true
+                                    }
+                                }
+                            }
+                            
+                            # Skip root folder
+                            if ($CurrentPath -eq "/" -or $CurrentPath -eq $RootPath) {
+                                Log "FTP: Skipping root folder '$CurrentPath'" "DEBUG"
+                                return
+                            }
+                            
+                            # Ensure it's under our root
+                            if (-not $CurrentPath.StartsWith($RootPath)) {
+                                Log "FTP: Folder '$CurrentPath' does not start with root '$RootPath', skipping" "DEBUG"
+                                return
+                            }
+                            
+                            if (-not $hasFiles -and -not $hasSubDirs) {
+                                Log "FTP: Found empty folder '$CurrentPath'" "DEBUG"
+                                [void]$EmptyFoldersList.Add($CurrentPath)
+                            }
+                            else {
+                                Log "FTP: Folder '$CurrentPath' is not empty (files: $hasFiles, subdirs: $hasSubDirs)" "DEBUG"
+                            }
+                        }
+                        catch {
+                            Log "FTP: Error listing directory '$CurrentPath': $($_.Exception.Message)" "DEBUG"
+                        }
+                    }
+                    
+                    # Find all empty folders recursively
+                    $emptyFoldersList = New-Object System.Collections.ArrayList
+                    Find-EmptyFolders -Session $session -CurrentPath $normalizedRoot -RootPath $normalizedRoot -EmptyFoldersList $emptyFoldersList
+                    
+                    Log "FTP: Found $($emptyFoldersList.Count) empty folder(s) to delete" "DEBUG"
+                    
+                    # Delete empty folders (already sorted deepest first by recursion)
+                    foreach ($dirPath in $emptyFoldersList) {
+                        try {
+                            Log "FTP: Deleting empty folder '$dirPath'..." "INFO"
+                            
+                            # Try multiple methods to delete empty directory
+                            # FileZilla log shows WinSCP isn't even sending RMD commands to the server
+                            # So we'll use ExecuteCommand to send raw FTP RMD command directly
+                            try {
+                                $cleanPath = $dirPath.TrimEnd('/')
+                                $deleted = $false
+                                
+                                # Method 1: Try raw FTP RMD command (bypasses WinSCP's checks)
+                                try {
+                                    # Send raw RMD command directly to FTP server
+                                    $cmdResult = $session.ExecuteCommand("RMD `"$cleanPath`"")
+                                    # If no exception, assume success
+                                    Log "FTP: deleted empty folder '$dirPath' using raw RMD command." "INFO"
+                                    $emptyFoldersDeleted++
+                                    $deleted = $true
+                                }
+                                catch {
+                                    $errorMsg = $_.Exception.Message
+                                    # Check if it's a "command not found" error vs actual failure
+                                    if ($errorMsg -notlike "*Wrong command*" -and $errorMsg -notlike "*not recognized*") {
+                                        Log "FTP: Raw RMD failed for '$dirPath': $errorMsg" "DEBUG"
+                                    }
+                                }
+                                
+                                # Method 2: Try RemoveFiles (WinSCP's method)
+                                if (-not $deleted) {
+                                    try {
+                                        $rmResult = $session.RemoveFiles($cleanPath)
+                                        if ($rmResult.IsSuccess -and $rmResult.Removals.Count -gt 0) {
+                                            Log "FTP: deleted empty folder '$dirPath' using RemoveFiles." "INFO"
+                                            $emptyFoldersDeleted++
+                                            $deleted = $true
+                                        }
+                                    }
+                                    catch {
+                                        Log "FTP: RemoveFiles failed for '$dirPath': $($_.Exception.Message)" "DEBUG"
+                                    }
+                                }
+                                
+                                # Method 3: Try RemoveFile (alternate API)
+                                if (-not $deleted) {
+                                    try {
+                                        $session.RemoveFile($cleanPath)
+                                        Log "FTP: deleted empty folder '$dirPath' using RemoveFile." "INFO"
+                                        $emptyFoldersDeleted++
+                                        $deleted = $true
+                                    }
+                                    catch {
+                                        Log "FTP: RemoveFile failed for '$dirPath': $($_.Exception.Message)" "DEBUG"
+                                    }
+                                }
+                                
+                                if (-not $deleted) {
+                                    Log "FTP: Could not delete empty folder '$dirPath' - FTP server may not support directory deletion." "DEBUG"
+                                }
+                            }
+                            catch {
+                                Log "FTP: FAILED to delete empty folder '$dirPath': $($_.Exception.Message)" "ERROR"
+                            }
+                        }
+                        catch {
+                            Log "FTP: Error deleting folder '$dirPath': $($_.Exception.Message)" "ERROR"
+                        }
+                    }
+                    
+                    if ($emptyFoldersDeleted -gt 0) {
+                        Log "FTP: Deleted $emptyFoldersDeleted empty folder(s)." "INFO"
+                    }
+                    else {
+                        Log "FTP: No empty folders found to delete." "DEBUG"
+                    }
+                }
+                catch {
+                    Log "FTP: Error checking for empty folders: $($_.Exception.Message)" "ERROR"
+                }
+            }
+
+            # Optionally rename/delete fully successful folders
+            if ($folderInfo.Count -gt 0 -and ($FtpMarkFolderAsReceived -or $FtpDeleteSourceFolder)) {
+                Log "FTP: Checking $($folderInfo.Count) folder(s) for post-download cleanup..." "DEBUG"
+                $orderedFolders = $folderInfo.Keys | Sort-Object { $_.Length} -Descending
+                foreach ($folder in $orderedFolders) {
+                    $state = $folderInfo[$folder]
+                    if (-not $state) { 
+                        Log "FTP: Folder '$folder' - no state object, skipping" "DEBUG"
+                        continue 
+                    }
+                    if (-not $state.Touched) { 
+                        Log "FTP: Folder '$folder' - not touched, skipping" "DEBUG"
+                        continue 
+                    }
+                    if (-not $state.AllSucceeded) { 
+                        Log "FTP: Folder '$folder' - not all operations succeeded, skipping" "DEBUG"
+                        continue 
+                    }
+                    if ($state.SkippedTooNew -gt 0) { 
+                        Log "FTP: Folder '$folder' - has $($state.SkippedTooNew) files still too new, skipping" "DEBUG"
+                        continue 
+                    }
+                    if (-not $FtpDeleteAfterDownload -and $state.Downloaded -eq 0 -and $state.SkippedSeen -eq 0) {
+                        Log "FTP: Folder '$folder' - no files downloaded or seen, skipping" "DEBUG"
+                        continue
+                    }
+                    
+                    Log "FTP: Folder '$folder' qualifies for cleanup (Downloaded: $($state.Downloaded), Skipped: $($state.SkippedSeen))" "INFO"
+                    Log "FTP: Normalized root is: '$normalizedRoot'" "DEBUG"
+
+                    # Normalize folder path to forward slashes for FTP
+                    $folderNormalized = $folder -replace '\\', '/'
+                    Log "FTP: Folder normalized from '$folder' to '$folderNormalized'" "DEBUG"
+                    
+                    if ([string]::IsNullOrWhiteSpace($folderNormalized) -or $folderNormalized.Length -le 1) { 
+                        Log "FTP: Folder '$folder' - normalized path is empty or too short, skipping" "DEBUG"
+                        continue 
+                    }
+                    
+                    # Ensure folder path starts with normalized root (both normalized to forward slashes)
+                    if (-not $folderNormalized.StartsWith($normalizedRoot)) { 
+                        Log "FTP: Folder '$folderNormalized' does not start with root '$normalizedRoot', skipping" "DEBUG"
+                        continue 
+                    }
+                    
+                    if ($folderNormalized -eq "/" -or $folderNormalized -eq $normalizedRoot) { 
+                        Log "FTP: Folder '$folderNormalized' is root folder, skipping" "DEBUG"
+                        continue 
+                    }
+                    
+                    Log "FTP: Folder '$folderNormalized' passed all checks, proceeding to deletion" "DEBUG"
+
+                    $lastSlash = $folderNormalized.LastIndexOf('/')
+                    if ($lastSlash -lt 0) { continue }
+                    $parent = $folderNormalized.Substring(0, $lastSlash)
+                    $name   = $folderNormalized.Substring($lastSlash + 1)
+                    $rootPrefix = if ($folderNormalized.StartsWith("/")) { "/" } else { "" }
+
+                    $targetFolder = $folderNormalized
+
+                    if ($FtpMarkFolderAsReceived) {
+                        $newName = "${name}_RECEIVED"
+                        $newFolder = if ($parent) { "$parent/$newName" } else { "$rootPrefix$newName" }
+
+                        try {
+                            $session.MoveFile($folderNormalized, $newFolder)
+                            Log "FTP: renamed folder '$folderNormalized' -> '$newFolder'"
+                            $targetFolder = $newFolder
+                        }
+                        catch {
+                            Log "FTP: FAILED to rename folder '$folderNormalized' -> '$newFolder': $($_.Exception.Message)" "WARN"
+                            $state.AllSucceeded = $false
+                            continue
+                        }
+                    }
+
+                    if ($FtpDeleteSourceFolder) {
+                        try {
+                            Log "FTP: Attempting to delete folder '$targetFolder'..." "DEBUG"
+                            
+                            # Delete folder and all contents recursively
+                            # This forcefully removes ALL files/folders, even "seen" ones
+                            try {
+                                $cleanPath = $targetFolder.TrimEnd('/')
+                                $escapedTargetFolder = $session.EscapeFileMask($cleanPath)
+                                Log "FTP: Escaped folder path: '$escapedTargetFolder'" "DEBUG"
+                                
+                                # Try recursive removal with wildcard (this removes files AND subdirectories)
+                                $wildcardPath = $escapedTargetFolder + "/*"
+                                Log "FTP: Recursively deleting all contents with pattern: '$wildcardPath'" "DEBUG"
+                                
+                                $rmContentResult = $session.RemoveFiles($wildcardPath)
+                                $removedCount = if ($rmContentResult) { $rmContentResult.Removals.Count } else { 0 }
+                                Log "FTP: Removed $removedCount item(s) from folder" "DEBUG"
+                                
+                                # Now try to remove the (hopefully empty) directory
+                                Log "FTP: Attempting to remove empty directory: '$cleanPath'" "DEBUG"
+                                try {
+                                    # Try using RemoveFiles on the empty directory path
+                                    $rmDirResult = $session.RemoveFiles($cleanPath)
+                                    if ($rmDirResult.IsSuccess -and $rmDirResult.Removals.Count -gt 0) {
+                                        Log "FTP: Successfully deleted folder '$targetFolder' and all contents (total: $($removedCount + $rmDirResult.Removals.Count) items removed)." "INFO"
+                                    }
+                                    else {
+                                        # Folder couldn't be removed - check why
+                                        Log "FTP: Folder '$cleanPath' removed $removedCount item(s) but directory itself could not be deleted." "WARN"
+                                        try {
+                                            $remainingFiles = $session.ListDirectory($cleanPath)
+                                            $fileCount = ($remainingFiles.Files | Where-Object { $_.Name -ne "." -and $_.Name -ne ".." }).Count
+                                            if ($fileCount -gt 0) {
+                                                Log "FTP: Folder '$cleanPath' still contains $fileCount item(s) after deletion attempt. Listing:" "WARN"
+                                                foreach ($item in $remainingFiles.Files) {
+                                                    if ($item.Name -ne "." -and $item.Name -ne "..") {
+                                                        Log "FTP:   - $($item.Name) (IsDir: $($item.IsDirectory))" "WARN"
+                                                    }
+                                                }
+                                            }
+                                            else {
+                                                Log "FTP: Folder appears empty but could not be removed. This is normal for some FTP servers." "DEBUG"
+                                            }
+                                        }
+                                        catch {
+                                            Log "FTP: Could not list folder contents: $($_.Exception.Message)" "DEBUG"
+                                        }
+                                    }
+                                }
+                                catch {
+                                    Log "FTP: Could not remove directory '$cleanPath': $($_.Exception.Message)" "DEBUG"
+                                    # This is often normal - some FTP servers don't allow empty directory removal
+                                    # The important part is that we removed all the files
+                                    if ($removedCount -gt 0) {
+                                        Log "FTP: Successfully removed $removedCount item(s) from folder '$targetFolder' (directory cleanup skipped)." "INFO"
+                                    }
+                                }
+                            }
+                            catch {
+                                Log "FTP: FAILED to delete folder '$targetFolder': $($_.Exception.Message)" "ERROR"
+                            }
+                        }
+                        catch {
+                            Log "FTP: error deleting folder '$targetFolder': $($_.Exception.Message)" "ERROR"
+                        }
+                    }
+                    else {
+                        Log "FTP: Folder deletion disabled (FtpDeleteSourceFolder=false), skipping folder '$targetFolder'" "DEBUG"
+                    }
+                }
+            }
+        }
+        catch {
+            Log "FTP ERROR: $($_.Exception.Message)" "ERROR"
+        }
+        finally {
+            if ($session) {
+                try { $session.Dispose() } catch {}
+            }
+        }
+    }
+    catch {
+        Log "FTP: FAILED to start session: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+# ----------------- CORE PROCESSING -----------------
+
+# Helper function to normalize relative paths and detect/prevent recursive folder patterns
+function Normalize-RelativePath {
+    param(
+        [string]$RelativePath,
+        [string]$FileName
+    )
+    
+    if ([string]::IsNullOrWhiteSpace($RelativePath)) {
+        return $FileName
+    }
+    
+    # Split path into parts
+    $pathParts = $RelativePath -split '\\'
+    
+    # Separate folder parts from filename
+    # The last part might be the filename, or the filename might be separate
+    $folderParts = @()
+    $lastPart = $pathParts[-1]
+    
+    # If the last part matches the filename, it's the filename, otherwise it's a folder
+    if ($pathParts.Length -gt 0) {
+        if ($lastPart -eq $FileName) {
+            # Filename is included in path - exclude it from folder parts
+            if ($pathParts.Length -gt 1) {
+                $folderParts = $pathParts[0..($pathParts.Length - 2)]
+            }
+        } else {
+            # Filename is not in path - all parts are folders
+            $folderParts = $pathParts
+        }
+    }
+    
+    # Filter out empty parts
+    $folderParts = $folderParts | Where-Object { $_ -and $_.Trim() -ne '' }
+    
+    if ($folderParts.Count -eq 0) {
+        return $FileName
+    }
+    
+    # CRITICAL FIX: Only remove CONSECUTIVE duplicate folder names
+    # This prevents paths like "folder\folder\file" from being created
+    # But preserves valid structures like "folder\folder.xml" or "folder\file.txt"
+    $normalizedFolders = @()
+    $previousPart = $null
+    
+    foreach ($part in $folderParts) {
+        # Skip if this folder name matches the previous one (consecutive duplicate)
+        if ($part -ne $previousPart) {
+            $normalizedFolders += $part
+            $previousPart = $part
+        }
+        else {
+            # Found consecutive duplicate - skip it
+            Log "Skipping consecutive duplicate folder name: '$part'" "DEBUG"
+        }
+    }
+    
+    # Reconstruct path - preserve original structure, only remove consecutive duplicates
+    if ($normalizedFolders.Count -gt 0) {
+        $normalizedPath = $normalizedFolders -join '\'
+        return Join-Path $normalizedPath $FileName
+    } else {
+        return $FileName
+    }
+}
+
+# Helper function to validate and sanitize scrap path before creation
+function Test-ScrapPathValid {
+    param(
+        [string]$ScrapPath
+    )
+    
+    # Check for illegal characters in path
+    $illegalChars = [System.IO.Path]::GetInvalidPathChars()
+    foreach ($char in $illegalChars) {
+        if ($ScrapPath.Contains($char)) {
+            return $false
+        }
+    }
+    
+    # Check for consecutive duplicate folder names (additional safety check)
+    if ($ScrapPath -match '([^\\]+)\\1') {
+        return $false
+    }
+    
+    # Check path length (Windows MAX_PATH is 260, but we allow up to 240 for safety margin)
+    if ($ScrapPath.Length -gt 240) {
+        # This is okay, we'll use extended paths, but log it
+        return $true
+    }
+    
+    return $true
+}
+
+function Invoke-FileProcessing {
+    param(
+        [string]$WorkSource
+    )
+
+    # Hard guard: never process from pipeline folders themselves
+    # Normalize paths for comparison
+    $normalizedWorkSource = (Resolve-Path -LiteralPath $WorkSource -ErrorAction SilentlyContinue).Path
+    $normalizedProcessed = (Resolve-Path -LiteralPath $ProcessedDir -ErrorAction SilentlyContinue).Path
+    $normalizedScrap = (Resolve-Path -LiteralPath $ScrapDir -ErrorAction SilentlyContinue).Path
+    
+    # Prevent processing from Processed or Scrap folders (or their subfolders)
+    if ($normalizedWorkSource -eq $normalizedProcessed -or $normalizedWorkSource -eq $normalizedScrap -or 
+        $normalizedWorkSource -like "$normalizedProcessed\*" -or $normalizedWorkSource -like "$normalizedScrap\*") {
+        Log "Refusing to process from '$WorkSource' (pipeline folder or subfolder) to avoid recursive nesting." "WARN"
+        return
+    }
+    
+    # Extra safety: also check if path contains "Scrap" anywhere (case-insensitive)
+    if ($normalizedWorkSource -match '\\Scrap\\' -or $normalizedWorkSource -match '\\Scrap$') {
+        Log "Refusing to process from '$WorkSource' (contains 'Scrap' in path) to avoid recursive nesting." "WARN"
+        return
+    }
+
+    if (-not (Test-Path $WorkSource)) {
+        Log "Work source '$WorkSource' does not exist." "WARN"
+        return
+    }
+
+    # Get canonical path (resolved, no trailing \)
+    $rootWork = (Resolve-Path -LiteralPath $WorkSource).Path.TrimEnd('\')
+
+    # CRITICAL CLEANUP: Remove any output folders that got created inside WorkSource
+    # This prevents recursive path building from previous bad runs
+    Log "Checking for corrupted folder structures in '$WorkSource'..." "DEBUG"
+    $badFolders = @(
+        (Join-Path $WorkSource "STL_Scrap"),
+        (Join-Path $WorkSource "STL_Processed"),
+        (Join-Path $WorkSource "Scrap"),
+        (Join-Path $WorkSource "Processed")
+    )
+    
+    foreach ($badFolder in $badFolders) {
+        if (Test-Path $badFolder) {
+            Log "WARNING: Found output folder inside work source: '$badFolder'" "WARN"
+            try {
+                Remove-Item -Path $badFolder -Recurse -Force -ErrorAction Stop
+                Log "Successfully removed corrupted folder: '$badFolder'" "INFO"
+            }
+            catch {
+                Log "Failed to remove corrupted folder '$badFolder': $($_.Exception.Message)" "ERROR"
+            }
+        }
+    }
+
+    # ============ PHASE 1: Process configured file types (STL, etc.) ============
+    Log "PHASE 1: Processing configured file types..." "INFO"
+    
+    # Recurse through all subfolders
+    $allFiles = Get-ChildItem $WorkSource -File -Recurse -ErrorAction SilentlyContinue
+    if (-not $allFiles -or $allFiles.Count -eq 0) {
+        Log "Processing: No files found in '$WorkSource'." "DEBUG"
+        return
+    }
+    
+    Log "Found $($allFiles.Count) total file(s) in '$WorkSource'." "INFO"
+    Write-LiveStatus -Status "Phase 1: Processing configured types" -FileName "$($allFiles.Count) files total"
+
+    $useLocalAgeFilter = $EnableFileAgeFilter -and ($Mode -ine "FTP") -and ([double]$MinFileAgeSeconds -gt 0)
+
+    $processedCount = 0
+    $stlProcessedCount = 0
+    
+    foreach ($file in $allFiles) {
+        try {
+            $sizeMB = [double]($file.Length / 1MB)
+            $processedCount++
+            
+            Write-LiveStatus -Status "Phase 1: Processing ($processedCount/$($allFiles.Count))" -FileName $file.Name -FileSizeMB $sizeMB
+            
+            # Extension check
+            $ext = $file.Extension.ToLowerInvariant().TrimStart('.')
+            
+            # Only process configured types in Phase 1
+            $isProcessable = $false
+            if ($ProcessExtensionSet) {
+                $isProcessable = $ProcessExtensionSet.Contains($ext)
+            }
+            
+            if (-not $isProcessable) {
+                # Skip non-configured files in Phase 1
+                continue
+            }
+            
+            Log "Processing configured file: '$($file.Name)' ($ext)" "DEBUG"
+
+            if (-not (Test-FileReady -File $file)) {
+                Add-JobRecord -Name $file.Name -Action "Waiting (locked)" -SizeMB $sizeMB -FileTime $file.LastWriteTime
+                Log "File '$($file.FullName)' appears to be in use. Will retry next poll." "INFO"
+                continue
+            }
+
+            if ($useLocalAgeFilter) {
+                $ageSeconds = ((Get-Date) - $file.LastWriteTime).TotalSeconds
+                if ($ageSeconds -lt [double]$MinFileAgeSeconds) {
+                    Add-JobRecord -Name $file.Name -Action "Waiting (too new)" -SizeMB $sizeMB -FileTime $file.LastWriteTime
+                    Log "Skipping '$($file.FullName)' - last write $([int]$ageSeconds)s ago (< $MinFileAgeSeconds s required)." "INFO"
+                    continue
+                }
+            }
+
+            # Get canonical file path
+            try {
+                $resolvedPath = Resolve-Path -LiteralPath $file.FullName -ErrorAction Stop
+                $fullPath = $resolvedPath.Path
+            }
+            catch {
+                Log "Failed to resolve path for '$($file.FullName)': $($_.Exception.Message)" "ERROR"
+                continue
+            }
+
+            # Compute relative path under WorkSource
+            if ($fullPath.Length -le $rootWork.Length) {
+                Log "File path '$fullPath' is not under root '$rootWork'" "ERROR"
+                continue
+            }
+            $relativePath = $fullPath.Substring($rootWork.Length).TrimStart('\')
+
+            # Duplicate detection
+            $dupStatus = Test-DuplicateFile -file $file
+            if ($null -eq $dupStatus) {
+                Add-JobRecord -Name $file.Name -Action "Waiting (hash busy)" -SizeMB $sizeMB -FileTime $file.LastWriteTime
+                Log "Deferring '$($file.FullName)' until hashing succeeds." "WARN"
+                continue
+            }
+
+            if ($dupStatus) {
+                # DUPLICATE STL FILE: Move to Scrap immediately, don't leave it lingering
+                Log "DUPLICATE STL detected: '$($file.Name)' - moving to Scrap now." "INFO"
+                
+                # Normalize relative path to prevent recursive folder creation
+                $normalizedRelative = Normalize-RelativePath -RelativePath $relativePath -FileName $file.Name
+                
+                $dupScrapPath = Join-Path $ScrapDir $normalizedRelative
+                $dupScrapDir = Split-Path $dupScrapPath -Parent
+                
+                # Validate path before creating
+                if (-not (Test-ScrapPathValid -ScrapPath $dupScrapPath)) {
+                    Log "Invalid scrap path detected for duplicate: '$dupScrapPath' - using filename only" "WARN"
+                    $dupScrapPath = Join-Path $ScrapDir $file.Name
+                    $dupScrapDir = $ScrapDir
+                }
+                
+                if (-not (Test-Path $dupScrapDir)) {
+                    try {
+                        New-Item -ItemType Directory -Path $dupScrapDir -Force | Out-Null
+                    }
+                    catch {
+                        Log "Failed to create directory for duplicate '$dupScrapDir': $($_.Exception.Message)" "ERROR"
+                        continue
+                    }
+                }
+                
+                try {
+                    # Use robocopy for safer moves to scrap (handles long paths and prevents issues)
+                    Move-FileSafely -Source $file.FullName -Destination $dupScrapPath -UseRobocopy
+                    $Script:Stats.TotalDuplicates++
+                    $stlProcessedCount++  # Count as processed even though it's scrapped
+                    Add-JobRecord -Name "$($file.Name) [DUP]" -Action "Duplicate" -SizeMB $sizeMB -FileTime $file.LastWriteTime
+                    Log "Moved duplicate STL to Scrap: $dupScrapPath" "INFO"
+                }
+                catch {
+                    Log "Failed to move duplicate '$($file.FullName)': $($_.Exception.Message)" "ERROR"
+                }
+                continue
+            }
+
+            # Process the file
+            Log "Processing $ext file: $($file.FullName)"
+
+            # For Processed, either keep subfolders or flatten based on config
+            $finalFileName = ""
+            $wasRenamed = $false
+            
+            if ($KeepProcessedSubfolders) {
+                $processedRelative = $relativePath
+                $finalFileName = $file.Name
+            }
+            else {
+                # Flatten
+                $processedRelative = $file.Name
+                $finalFileName = $file.Name
+                $testPath = Join-Path $ProcessedDir $file.Name
+                
+                if (Test-Path $testPath) {
+                    $existingHash = Get-FileHashString -Path $testPath
+                    $currentHash = Get-FileHashString -Path $file.FullName
+                    
+                    if ($existingHash -and $currentHash -and $existingHash -eq $currentHash) {
+                        Log "Unexpected: File '$($file.Name)' matches existing file hash in Processed." "WARN"
+                    }
+                    else {
+                        $parentFolder = Split-Path (Split-Path $file.FullName -Parent) -Leaf
+                        if ($parentFolder) {
+                            $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+                            $extension = $file.Extension
+                            $newFileName = "${parentFolder}_${baseName}${extension}"
+                            $processedRelative = $newFileName
+                            $finalFileName = $newFileName
+                            $wasRenamed = $true
+                            Log "Conflict detected: '$($file.Name)' exists with different hash. Renaming to '$newFileName'."
+                        }
+                        else {
+                            $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+                            $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+                            $extension = $file.Extension
+                            $newFileName = "${baseName}_${timestamp}${extension}"
+                            $processedRelative = $newFileName
+                            $finalFileName = $newFileName
+                            $wasRenamed = $true
+                            Log "Conflict detected: '$($file.Name)' exists with different hash. Renaming to '$newFileName'."
+                        }
+                    }
+                }
+            }
+
+            $final = Join-Path $ProcessedDir $processedRelative
+            $finalDir = Split-Path $final -Parent
+
+            if (-not (Test-Path $finalDir)) {
+                New-Item -ItemType Directory -Path $finalDir -Force | Out-Null
+            }
+
+            if (Test-Path $final) {
+                $timestamp = Get-Date -Format "yyyyMMdd_HHmmss_fff"
+                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($final)
+                $extension = [System.IO.Path]::GetExtension($final)
+                $final = Join-Path $finalDir "${baseName}_${timestamp}${extension}"
+                $finalFileName = Split-Path $final -Leaf
+                $wasRenamed = $true
+                Log "Destination still exists after conflict resolution, using timestamped name: $final" "WARN"
+            }
+
+            Move-FileSafely -Source $file.FullName -Destination $final
+            Add-FileHashToStore -FilePath $final
+            $stlProcessedCount++
+            $Script:Stats.TotalProcessedSTL++
+            
+            $displayName = if ($wasRenamed) { "$($file.Name) -> $finalFileName" } else { $file.Name }
+            Add-JobRecord -Name $displayName -Action "Processed" -SizeMB $sizeMB -FileTime $file.LastWriteTime
+            $Script:Stats.LastFileName = $displayName
+            $Script:Stats.LastFileAction = "Processed"
+            Log "File moved to: $final"
+        }
+        catch {
+            Log "Error processing '$($file.FullName)': $($_.Exception.Message)" "ERROR"
+        }
+    }
+
+    Clear-LiveStatus
+    Write-Host "  ✓ Phase 1 complete - $stlProcessedCount configured file(s) processed" -ForegroundColor Green
+    Log "Phase 1 complete: $stlProcessedCount configured files processed" "INFO"
+
+    # ============ PHASE 2: Batch move remaining folder structure to Scrap ============
+    Log "PHASE 2: Moving remaining folder structure to Scrap..." "INFO"
+    Write-LiveStatus -Status "Phase 2: Moving folders to Scrap" -FileName "Scanning remaining folders"
+    
+    # Get top-level folders in WorkSource (these are the FTP folder structures)
+    $topLevelFolders = Get-ChildItem -Path $WorkSource -Directory -ErrorAction SilentlyContinue | Where-Object {
+        $folderPath = $_.FullName
+        # Exclude output directories
+        $folderPath -notlike "*\STL_Scrap\*" -and 
+        $folderPath -notlike "*\STL_Processed\*" -and
+        $folderPath -notlike "*\Scrap\*" -and
+        $folderPath -notlike "*\Processed\*"
+    }
+    
+    if (-not $topLevelFolders -or $topLevelFolders.Count -eq 0) {
+        Clear-LiveStatus
+        Write-Host "  ✓ Phase 2 complete - No folders remaining to scrap" -ForegroundColor Green
+        Log "Phase 2 complete: No remaining folders" "INFO"
+    }
+    else {
+        Log "Found $($topLevelFolders.Count) top-level folder(s) to move to Scrap" "INFO"
+        
+        $scrapCount = 0
+        $scrapProcessed = 0
+        $scrapErrors = 0
+        
+        foreach ($folder in $topLevelFolders) {
+            try {
+                $scrapProcessed++
+                $folderName = $folder.Name
+                
+                Write-LiveStatus -Status "Phase 2: Moving folder ($scrapProcessed/$($topLevelFolders.Count))" -FileName $folderName
+                
+                # Calculate destination path - preserve folder structure
+                $scrapFolderPath = Join-Path $ScrapDir $folderName
+                
+                # Check if folder already exists in scrap
+                if (Test-Path $scrapFolderPath) {
+                    Log "Folder already exists in scrap: '$scrapFolderPath' - merging contents" "WARN"
+                    # Merge: move files individually with hash checking
+                    $filesInFolder = Get-ChildItem -Path $folder.FullName -File -Recurse -ErrorAction SilentlyContinue
+                    foreach ($file in $filesInFolder) {
+                        try {
+                            $relativePath = $file.FullName.Substring($folder.FullName.Length).TrimStart('\')
+                            $destPath = Join-Path $scrapFolderPath $relativePath
+                            $destDir = Split-Path $destPath -Parent
+                            
+                            # Check for duplicates using hash
+                            if (Test-Path $destPath) {
+                                $existingHash = Get-FileHashString -Path $destPath
+                                $currentHash = Get-FileHashString -Path $file.FullName
+                                if ($existingHash -and $currentHash -and $existingHash -eq $currentHash) {
+                                    Log "Duplicate file detected (hash match): '$($file.Name)' - skipping" "DEBUG"
+                                    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+                                    continue
+                                }
+                            }
+                            
+                            # Create directory if needed
+                            if (-not (Test-Path $destDir)) {
+                                New-Item -ItemType Directory -Path $destDir -Force -ErrorAction Stop | Out-Null
+                            }
+                            
+                            # Move file with robocopy
+                            Move-FileSafely -Source $file.FullName -Destination $destPath -UseRobocopy
+                            Add-FileHashToStore -FilePath $destPath
+                            $scrapCount++
+                            $Script:Stats.TotalScrappedNonStl++
+                        }
+                        catch {
+                            Log "Error moving file '$($file.FullName)': $($_.Exception.Message)" "ERROR"
+                            $scrapErrors++
+                        }
+                    }
+                    # Remove source folder after moving files
+                    try {
+                        Remove-Item -Path $folder.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                    catch {
+                        Log "Warning: Could not remove source folder '$($folder.FullName)': $($_.Exception.Message)" "WARN"
+                    }
+                }
+                else {
+                    # Folder doesn't exist in scrap - move files individually with duplicate checking and renaming
+                    # This ensures proper hash checking and conflict resolution
+                    $filesInFolder = Get-ChildItem -Path $folder.FullName -File -Recurse -ErrorAction SilentlyContinue
+                    
+                    foreach ($file in $filesInFolder) {
+                        try {
+                            $relativePath = $file.FullName.Substring($folder.FullName.Length).TrimStart('\')
+                            $destPath = Join-Path $scrapFolderPath $relativePath
+                            $destDir = Split-Path $destPath -Parent
+                            
+                            # Check for duplicates using hash (same as Phase 1)
+                            $dupStatus = Test-DuplicateFile -file $file
+                            if ($null -eq $dupStatus) {
+                                Log "Deferring '$($file.FullName)' until hashing succeeds." "WARN"
+                                continue
+                            }
+                            
+                            if ($dupStatus) {
+                                # Duplicate file - skip it
+                                Log "Duplicate file detected (hash match): '$($file.Name)' - skipping" "DEBUG"
+                                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+                                continue
+                            }
+                            
+                            # Check if file already exists in scrap with same name
+                            if (Test-Path $destPath) {
+                                # File exists - check if it's the same (hash) or different (rename)
+                                $existingHash = Get-FileHashString -Path $destPath
+                                $currentHash = Get-FileHashString -Path $file.FullName
+                                
+                                if ($existingHash -and $currentHash -and $existingHash -eq $currentHash) {
+                                    # Same file (duplicate) - skip it
+                                    Log "Duplicate file detected (hash match): '$($file.Name)' - skipping" "DEBUG"
+                                    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+                                    continue
+                                }
+                                else {
+                                    # Different file with same name - rename it
+                                    $parentFolder = Split-Path (Split-Path $file.FullName -Parent) -Leaf
+                                    if ($parentFolder) {
+                                        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+                                        $extension = $file.Extension
+                                        $newFileName = "${parentFolder}_${baseName}${extension}"
+                                        $destPath = Join-Path $destDir $newFileName
+                                        Log "Conflict detected in scrap: '$($file.Name)' exists with different hash. Renaming to '$newFileName'." "INFO"
+                                    }
+                                    else {
+                                        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+                                        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+                                        $extension = $file.Extension
+                                        $newFileName = "${baseName}_${timestamp}${extension}"
+                                        $destPath = Join-Path $destDir $newFileName
+                                        Log "Conflict detected in scrap: '$($file.Name)' exists with different hash. Renaming to '$newFileName'." "INFO"
+                                    }
+                                }
+                            }
+                            
+                            # Create directory if needed
+                            if (-not (Test-Path $destDir)) {
+                                New-Item -ItemType Directory -Path $destDir -Force -ErrorAction Stop | Out-Null
+                            }
+                            
+                            # Move file with robocopy
+                            Move-FileSafely -Source $file.FullName -Destination $destPath -UseRobocopy
+                            Add-FileHashToStore -FilePath $destPath
+                            $scrapCount++
+                            $Script:Stats.TotalScrappedNonStl++
+                            
+                            # Add to activity list
+                            $fileSizeMB = [Math]::Round($file.Length / 1MB, 2)
+                            Add-JobRecord -Name $file.Name -Action "Scrapped" -SizeMB $fileSizeMB -FileTime $file.LastWriteTime
+                        }
+                        catch {
+                            Log "Error moving file '$($file.FullName)': $($_.Exception.Message)" "ERROR"
+                            $scrapErrors++
+                        }
+                    }
+                    
+                    # Remove source folder after moving all files
+                    try {
+                        # Check if folder is empty before removing
+                        $remainingFiles = Get-ChildItem -Path $folder.FullName -File -Recurse -ErrorAction SilentlyContinue
+                        if ($remainingFiles.Count -eq 0) {
+                            Remove-Item -Path $folder.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                            Log "Moved folder '$folderName' to Scrap: $scrapFolderPath ($scrapCount files)" "INFO"
+                        }
+                        else {
+                            Log "Warning: Folder '$folderName' still contains $($remainingFiles.Count) file(s) after move attempt" "WARN"
+                        }
+                    }
+                    catch {
+                        Log "Warning: Could not remove source folder '$($folder.FullName)': $($_.Exception.Message)" "WARN"
+                    }
+                }
+            }
+            catch {
+                Log "Error moving folder '$($folder.FullName)': $($_.Exception.Message)" "ERROR"
+                $scrapErrors++
+            }
+        }
+        
+        Clear-LiveStatus
+        if ($scrapErrors -gt 0) {
+            Write-Host "  ⚠ Phase 2 complete - $scrapCount files moved, $scrapErrors errors (check log)" -ForegroundColor Yellow
+            Log "Phase 2 complete: $scrapCount files moved to Scrap, $scrapErrors errors" "WARN"
+        }
+        else {
+            Write-Host "  ✓ Phase 2 complete - $scrapCount file(s) moved to Scrap" -ForegroundColor Green
+            Log "Phase 2 complete: $scrapCount files moved to Scrap" "INFO"
+        }
+    }
+
+    # After processing all files, remove empty directories under WorkSource
+    try {
+        Get-ChildItem -Path $WorkSource -Directory -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | ForEach-Object {
+                $dirPath = $_.FullName
+                if (-not (Get-ChildItem -Path $dirPath -Force -ErrorAction SilentlyContinue)) {
+                    if (Remove-DirectorySafely -Path $dirPath) {
+                        Log "Removed empty folder: $dirPath"
+                    }
+                }
+            }
+    }
+    catch {
+        Log "Error cleaning empty folders under '$WorkSource': $($_.Exception.Message)" "WARN"
+    }
+}
+
+# ===================== MAIN LOOP ======================
+
+# Validate config before we start looping
+Test-Config
+
+Initialize-Folders
+Import-ProcessedHashStore
+Clear-OldFtpArrivalTimes
+Clear-OldLogFiles
+Log "=== StlMoverService started (Mode = $Mode, Poll = $PollInterval sec, HashRetention = $HashRetentionDays day(s)) ==="
+
+while ($true) {
+    try {
+        $displaySource = if ($Mode -ieq "FTP") {
+            if ($FtpHost -and $FtpRemoteDir) {
+                "ftp://$FtpHost$FtpRemoteDir"
+            }
+            elseif ($FtpRemoteDir) {
+                $FtpRemoteDir
+            }
+            else {
+                $DownloadDir
+            }
+        }
+        elseif ($Mode -ieq "SMB") {
+            $SourceDirSmb
+        }
+        else {
+            $SourceDirLocal
+        }
+
+        $displayOutput = $ProcessedDir
+
+        Write-Host ""  # Just a blank line for spacing
+
+        if ($Mode -ieq "FTP") {
+            Invoke-FtpDownload
+            Invoke-FileProcessing -WorkSource $DownloadDir
+        }
+        elseif ($Mode -ieq "SMB") {
+            Invoke-FileProcessing -WorkSource $SourceDirSmb
+        }
+        else {
+            Invoke-FileProcessing -WorkSource $SourceDirLocal
+        }
+
+        # Clean up completed jobs that are older than display threshold
+        Clear-CompletedJobs
+        
+        # Store display parameters globally for HUD refreshes during operations
+        $Script:HUD_Mode = $Mode
+        $Script:HUD_WorkSource = $displaySource
+        $Script:HUD_OutputPath = $displayOutput
+        $Script:HUD_PollInterval = $PollInterval
+        
+        # Render HUD *after* work so stats + job table match logs
+        Show-UI -Mode $Mode -WorkSource $displaySource -OutputPath $displayOutput -PollInterval $PollInterval
+    }
+    catch {
+        Log "Loop error: $($_.Exception.Message)" "ERROR"
+    }
+
+    Show-Countdown -Seconds $PollInterval
+}
